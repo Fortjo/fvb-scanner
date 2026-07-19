@@ -43,13 +43,12 @@ def scan_ticker(tk: str, fresh_weeks: int):
     if len(df) < bt.NBAR_LEN + 20:
         return None
 
-    # historical stats for THIS ticker under the exact same strategy — used
-    # to RATE a fresh entry, not just flag that one exists. A fresh signal
-    # on a ticker that's won 90% of its past trades is a very different
-    # thing from a fresh signal on one that's been a coin flip.
-    hist_trades = bt.run(df, "High", "NBarHigh")
-    hist_stats = bt.stats(hist_trades)
-
+    # [PERFORMANCE FIX] this used to call bt.run() for historical stats AND
+    # ALSO run a separate, near-identical loop below to track the live
+    # position — simulating the entire history TWICE per ticker for no
+    # reason. Merged into one pass: the same loop that tracks the current
+    # position also records each completed trade, and historical stats are
+    # computed from those recorded trades afterward.
     frac = bt.BAND_FRACS["High"]
     o, hgh, lw, cl = (df[c].values for c in ["Open", "High", "Low", "Close"])
     basis, green = df["basis"].values, df["green"].values
@@ -59,6 +58,7 @@ def scan_ticker(tk: str, fresh_weeks: int):
     halfw = df["halfw"].values if not has_real else None
     idx = df.index
 
+    hist_trades = []
     in_pos, entry_px, entry_i = False, np.nan, -1
     for i in range(len(df)):
         band_px = (upperR[i] if has_real else basis[i] + frac * halfw[i])
@@ -69,6 +69,11 @@ def scan_ticker(tk: str, fresh_weeks: int):
             elif not green[i]:
                 exit_px, reason = cl[i], "STOP"
             if exit_px is not None:
+                hist_trades.append({
+                    "entry_date": idx[entry_i], "exit_date": idx[i],
+                    "ret": exit_px / entry_px - 1 - bt.RT_COST,
+                    "hold": i - entry_i, "reason": reason,
+                })
                 in_pos = False
                 continue
         if i > 0:
@@ -79,6 +84,12 @@ def scan_ticker(tk: str, fresh_weeks: int):
                 and lw[i] <= band_px and i > 0 and not np.isnan(prior_band_px) \
                 and cl[i - 1] > prior_band_px:                     # noqa: E712
             entry_px, entry_i, in_pos = min(o[i], band_px), i, True
+
+    # historical stats for THIS ticker under the exact same strategy — used
+    # to RATE a fresh entry, not just flag that one exists. A fresh signal
+    # on a ticker that's won 90% of its past trades is a very different
+    # thing from a fresh signal on one that's been a coin flip.
+    hist_stats = bt.stats(hist_trades)
 
     last_i = len(df) - 1
     result = {
