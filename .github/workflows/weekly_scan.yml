@@ -2,14 +2,15 @@ name: Weekly 33FVB Scan
 
 on:
   schedule:
-    # Runs every Sunday at 18:00 UTC. GitHub Actions cron is ALWAYS UTC —
-    # adjust this number for your local Sunday-evening preference. As a
-    # reference: 18:00 UTC = 1:00 PM US Eastern / 10:00 AM US Pacific /
-    # 19:00 or 20:00 Central Europe depending on daylight saving.
-    - cron: '0 18 * * 0'
+    # Runs every Saturday at 6:00 AM Bulgaria time. GitHub Actions cron is
+    # ALWAYS UTC — Bulgaria is UTC+3 in summer (EEST) and UTC+2 in winter
+    # (EET), so this line needs a manual one-hour adjustment twice a year:
+    #   Summer (EEST, roughly late Mar-late Oct): use '0 3 * * 6' (current)
+    #   Winter (EET,  roughly late Oct-late Mar):  use '0 4 * * 6'
+    - cron: '0 3 * * 6'
   workflow_dispatch:
     # Lets you manually trigger a run anytime from the GitHub Actions tab,
-    # e.g. to test the setup without waiting for Sunday.
+    # e.g. to test the setup without waiting for Saturday.
 
 jobs:
   scan:
