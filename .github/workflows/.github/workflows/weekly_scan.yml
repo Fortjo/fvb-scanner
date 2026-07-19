@@ -1,0 +1,32 @@
+name: Weekly 33FVB Scan
+
+on:
+  schedule:
+    # Runs every Sunday at 18:00 UTC. GitHub Actions cron is ALWAYS UTC —
+    # adjust this number for your local Sunday-evening preference. As a
+    # reference: 18:00 UTC = 1:00 PM US Eastern / 10:00 AM US Pacific /
+    # 19:00 or 20:00 Central Europe depending on daylight saving.
+    - cron: '0 18 * * 0'
+  workflow_dispatch:
+    # Lets you manually trigger a run anytime from the GitHub Actions tab,
+    # e.g. to test the setup without waiting for Sunday.
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy
+
+      - name: Run scan and send email
+        env:
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python send_scan_email.py
