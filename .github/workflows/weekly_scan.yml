@@ -7,7 +7,7 @@ on:
     # (EET), so this line needs a manual one-hour adjustment twice a year:
     #   Summer (EEST, roughly late Mar-late Oct): use '0 3 * * 6' (current)
     #   Winter (EET,  roughly late Oct-late Mar):  use '0 4 * * 6'
-    - cron: '0 3 * * 6'
+    - cron: '17 5 * * 0'
   workflow_dispatch:
     # Lets you manually trigger a run anytime from the GitHub Actions tab,
     # e.g. to test the setup without waiting for Saturday.
