@@ -64,7 +64,7 @@ def build_email_body(fresh_weeks: int = 12) -> str:
     lines.append("\n" + "=" * 70)
     lines.append("Full data attached as CSV. Reminder: this is historical backtest")
     lines.append("performance, not a guarantee — check each chart before acting.")
-    return "\n".join(lines), fresh, len(df), fresh
+    return "\n".join(lines), fresh, len(df)
 
 
 def build_email_body_html(fresh: pd.DataFrame, total_checked: int) -> str:
