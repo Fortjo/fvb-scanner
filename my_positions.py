@@ -107,7 +107,7 @@ def build_positions_section():
                       f"P&L {pct_pl:+.1f}% (${dollar_pl:+.2f})")
         tp_str = f"{pct_to_tp:.1f}%" if not np.isnan(pct_to_tp) else "n/a"
         risk_str = f"{pct_to_risk:.1f}%" if not np.isnan(pct_to_risk) else "n/a"
-        lines.append(f"  TP trigger: {tp_str} away | Stop level: {risk_str} away | FVB state: {fvb_state}")
+        lines.append(f"  TP trigger: {tp_str} away | Lower band: {risk_str} below | FVB state: {fvb_state}")
 
     if alerts:
         alert_block = "\n** ALERTS THIS WEEK **\n" + "\n".join(f"  - {a}" for a in alerts) + "\n"
