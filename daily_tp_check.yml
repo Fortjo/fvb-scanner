@@ -1,0 +1,35 @@
+name: Daily TP Check
+
+on:
+  schedule:
+    # Runs weekdays at ~9:17 PM Bulgaria time (after US market close),
+    # so the day's price action is already reflected. Same UTC-adjustment
+    # rule as weekly_scan.yml — Bulgaria is UTC+3 in summer (EEST), UTC+2
+    # in winter (EET):
+    #   Summer (EEST, roughly late Mar-late Oct): use '17 18 * * 1-5' (current)
+    #   Winter (EET,  roughly late Oct-late Mar):  use '17 19 * * 1-5'
+    # Minute is 17 (not 0) to dodge GitHub's top-of-hour congestion window.
+    - cron: '17 18 * * 1-5'
+  workflow_dispatch:
+    # Manual trigger from the Actions tab, e.g. to test right after
+    # updating my_positions.csv with a new entry.
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy
+
+      - name: Check open positions for TP hits
+        env:
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python daily_tp_check.py
