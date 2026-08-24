@@ -1,0 +1,25 @@
+name: Small-Cap 33FVB Scan
+
+on:
+  schedule:
+    # Saturday 08:00 UTC — separate day from the main weekly_scan.yml
+    # (Friday close), so the two emails don't land at the same time.
+    - cron: '0 8 * * 6'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy
+      - name: Run small-cap scan and send email
+        env:
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python send_small_cap_email.py
