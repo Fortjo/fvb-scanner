@@ -1,0 +1,25 @@
+name: Small-Cap Daily TP Check
+
+on:
+  schedule:
+    # Weekdays, 18:17 UTC — same time as the main daily_tp_check.yml,
+    # just a different workflow so the two stay independent.
+    - cron: '17 18 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy
+      - name: Check small-cap positions for TP hits
+        env:
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: python small_cap_daily_tp_check.py
