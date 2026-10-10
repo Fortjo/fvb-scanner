@@ -50,13 +50,14 @@ def build_email_body(fresh_weeks: int = 12) -> str:
     else:
         for _, row in fresh.iterrows():
             below_warn = " ** BELOW STOP LEVEL (close basis) — check chart **" if row.get("below_stop_level") else ""
+            thin_warn = " ** THIN BAND SAMPLE — verify on TradingView Monthly chart before acting **" if row.get("thin_sample") else ""
             rr = row["risk_reward"]
             rr_str = f"{rr:.1f}" if pd.notna(rr) else "n/a"
             lines.append(f"\n{row['ticker']}  —  {row['rating']}")
             lines.append(f"  Entered {row['entry_date']} ({row['weeks_held']:.0f} wks ago), open P&L {row['open_pl_pct']:+.1f}%")
             lines.append(f"  History: {row['hist_trades']:.0f} trades, {row['hist_win_rate']:.1f}% win rate, "
                           f"{row['hist_expectancy']:+.1f}% expectancy/trade")
-            lines.append(f"  Risk/reward from here: {rr_str}{below_warn}")
+            lines.append(f"  Risk/reward from here: {rr_str}{below_warn}{thin_warn}")
 
     lines.append(my_positions.build_positions_section())
     lines.append(my_positions.build_closed_positions_section())
@@ -77,6 +78,7 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int) -> str:
         rr_str = f"{rr:.1f}" if pd.notna(rr) else "n/a"
         below_warn = ('<br><span style="color:#c0392b;font-weight:bold;">&#9888; BELOW STOP LEVEL '
                       '(close basis) — check chart</span>') if row.get("below_stop_level") else ""
+        thin_warn = ('<br><span style="color:#b8860b;font-weight:bold;">&#9888; THIN BAND SAMPLE — verify on TradingView Monthly chart</span>') if row.get("thin_sample") else ""
         pl_color = "#1a7a1a" if row["open_pl_pct"] >= 0 else "#c0392b"
         rows_html.append(f"""
         <tr>
@@ -88,7 +90,7 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int) -> str:
               {row['open_pl_pct']:+.1f}%</td>
           <td style="padding:8px;border-bottom:1px solid #ddd;">{row['hist_trades']:.0f} trades<br>
               <span style="color:#666;font-size:12px;">{row['hist_win_rate']:.1f}% win, {row['hist_expectancy']:+.1f}% exp.</span></td>
-          <td style="padding:8px;border-bottom:1px solid #ddd;">{rr_str}{below_warn}</td>
+          <td style="padding:8px;border-bottom:1px solid #ddd;">{rr_str}{below_warn}{thin_warn}</td>
         </tr>""")
 
     fresh_table = ""

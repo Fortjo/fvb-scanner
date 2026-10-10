@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 33FVB Strategy Reconstruction — Python backtest (yfinance)
 ===========================================================
@@ -269,6 +270,21 @@ def _compute_real_fvb(m: pd.DataFrame, length: int):
     upper = pd.Series(upper_band, index=m.index)
     lower = pd.Series(lower_band, index=m.index)
     return green, upper, lower
+
+
+def straddle_sample_size(m, length: int) -> int:
+    """How many historical months actually feed the FVB band-width
+    median right now. A small number here (confirmed on XEL: 51 months
+    since 1973, vs VZ: 83) means the band width is statistically
+    fragile and more likely to diverge from TradingView's own feed due
+    to small price-data differences between data vendors (dividend/
+    split adjustment, etc). Diagnostic/warning use only — does NOT
+    affect basis, band, state, or any entry/exit/trade logic anywhere.
+    """
+    ohlc4 = (m["Open"] + m["High"] + m["Low"] + m["Close"]) / 4
+    basis = ohlc4.rolling(length).mean()
+    straddle = (m["Low"] < basis) & (m["High"] > basis)
+    return int(straddle.sum())
 
 # --------------------------------------------------------------------------
 # INDICATOR PREP  (monthly FVB -> weekly bars, shifted 1 month, no lookahead)

@@ -43,6 +43,14 @@ def scan_ticker(tk: str, fresh_weeks: int):
     if len(df) < bt.NBAR_LEN + 20:
         return None
 
+    # [THIN SAMPLE WARNING] how many historical months actually feed this
+    # ticker's band-width median — a small number means the band is more
+    # sensitive to Yahoo-vs-TradingView data differences. Diagnostic only,
+    # does not affect any entry/exit/trade logic above or below this line.
+    m_monthly = raw.resample("ME").agg({"Open": "first", "High": "max",
+                                         "Low": "min", "Close": "last"}).dropna()
+    straddle_n = bt.straddle_sample_size(m_monthly, bt.FVB_LEN)
+
     # [PERFORMANCE FIX] this used to call bt.run() for historical stats AND
     # ALSO run a separate, near-identical loop below to track the live
     # position — simulating the entire history TWICE per ticker for no
@@ -103,6 +111,8 @@ def scan_ticker(tk: str, fresh_weeks: int):
         "hist_win_rate": hist_stats["win_rate"],
         "hist_expectancy": hist_stats["expectancy"],
         "hist_pf": hist_stats["pf"],
+        "straddle_sample": straddle_n,
+        "thin_sample": straddle_n < 75,
     }
     # [RATING] transparent, not a black-box score — just a plain-language
     # read of this ticker's OWN track record under this exact strategy.
