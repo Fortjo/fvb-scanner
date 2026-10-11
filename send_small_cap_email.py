@@ -26,6 +26,7 @@ import pandas as pd
 import scan_current_buys as scb
 import backtest_33fvb as bt
 import small_cap_positions
+import my_positions
 
 TICKER_FILE = "small_cap_tickers.csv"
 
@@ -53,7 +54,9 @@ def build_email_body(fresh_weeks: int = 12) -> str:
 
     longs = df[df["position"] == "LONG"].copy()
     longs["fresh"] = longs["fresh"].astype(bool)
-    held_tickers = small_cap_positions.get_open_tickers()
+    # [FIX] a ticker already held in the MAIN scanner's book (my_positions.csv)
+    # is excluded here too, not just ones tracked in small_cap_positions.csv.
+    held_tickers = small_cap_positions.get_open_tickers() | my_positions.get_open_tickers()
     longs = longs[~longs["ticker"].str.upper().isin(held_tickers)]
     fresh = longs[longs["fresh"]].sort_values("hist_expectancy", ascending=False)
 
@@ -65,6 +68,7 @@ def build_email_body(fresh_weeks: int = 12) -> str:
         lines.append("\nNo fresh buy signals this week.")
     else:
         for _, r in fresh.iterrows():
+            thin_warn = "\n  ** THIN BAND SAMPLE — verify on TradingView Monthly chart before acting **" if r.get("thin_sample") else ""
             lines.append(
                 f"\n{r['ticker']}\n"
                 f"  Entered {r['entry_date']} ({r['weeks_held']}wks ago)\t"
@@ -72,6 +76,7 @@ def build_email_body(fresh_weeks: int = 12) -> str:
                 f"  History: {r['hist_trades']} trades, "
                 f"{r['hist_win_rate']:.1f}% win, {r['hist_expectancy']:+.1f}% exp.\t"
                 f"R/R {r['risk_reward']}"
+                f"{thin_warn}"
             )
 
     positions = small_cap_positions.load()
