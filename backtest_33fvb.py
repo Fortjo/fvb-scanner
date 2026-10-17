@@ -286,6 +286,68 @@ def straddle_sample_size(m, length: int) -> int:
     straddle = (m["Low"] < basis) & (m["High"] > basis)
     return int(straddle.sum())
 
+
+def fetch_daily(ticker: str):
+    """Daily OHLC — used ONLY for the daily-structure confidence tag
+    below, completely separate from the weekly fetch() used for every
+    entry/exit/trade decision. Nothing here touches trade logic."""
+    import yfinance as yf
+    df = yf.download(ticker, start=START, interval="1d",
+                      auto_adjust=True, progress=False)
+    if df is None or df.empty:
+        return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    return df[["Open", "High", "Low", "Close"]].dropna()
+
+
+def _confirmed_pivots(values, piv_l: int, piv_r: int, kind: str):
+    """Same confirmed-pivot pattern used for the weekly pivot_conf column
+    in prep() — mirrored here on DAILY bars. A pivot's value only
+    becomes known piv_r bars after it forms (no lookahead)."""
+    n = len(values)
+    conf = np.full(n, np.nan)
+    for i in range(piv_l, n - piv_r):
+        w = values[i - piv_l: i + piv_r + 1]
+        if kind == "high":
+            ok = values[i] == w.max() and (w == values[i]).sum() == 1
+        else:
+            ok = values[i] == w.min() and (w == values[i]).sum() == 1
+        if ok:
+            conf[i + piv_r] = values[i]
+    return conf
+
+
+def daily_structure_tag(daily, piv_l: int = 10, piv_r: int = 10) -> str:
+    """BULLISH / MIXED / BEARISH / INSUFFICIENT read of the two most
+    recently confirmed daily swing highs and lows, as of the latest
+    available daily bar:
+      BULLISH = higher high AND higher low (HH + HL)
+      BEARISH = lower high AND lower low (LH + LL)
+      MIXED   = anything else
+    Validated (see module docstring / apply_daily_structure_tag.py):
+    BULLISH entries win 76.1% / +18.7% exp / PF 4.69 vs BEARISH's
+    67.1% / +14.5% exp / PF 3.00, across 1,840 trades, 170 tickers.
+    Diagnostic/confidence tag only — does not affect entry/exit/trade
+    logic anywhere; bearish-structure signals are still shown, just
+    labeled with lower confidence.
+    """
+    if daily is None or len(daily) < (piv_l + piv_r + 2):
+        return "INSUFFICIENT"
+    conf_high = _confirmed_pivots(daily["High"].values, piv_l, piv_r, "high")
+    conf_low = _confirmed_pivots(daily["Low"].values, piv_l, piv_r, "low")
+    high_idxs = np.where(~np.isnan(conf_high))[0]
+    low_idxs = np.where(~np.isnan(conf_low))[0]
+    if len(high_idxs) < 2 or len(low_idxs) < 2:
+        return "INSUFFICIENT"
+    last_h, prev_h = conf_high[high_idxs[-1]], conf_high[high_idxs[-2]]
+    last_l, prev_l = conf_low[low_idxs[-1]], conf_low[low_idxs[-2]]
+    if last_h > prev_h and last_l > prev_l:
+        return "BULLISH"
+    if last_h < prev_h and last_l < prev_l:
+        return "BEARISH"
+    return "MIXED"
+
 # --------------------------------------------------------------------------
 # INDICATOR PREP  (monthly FVB -> weekly bars, shifted 1 month, no lookahead)
 # --------------------------------------------------------------------------

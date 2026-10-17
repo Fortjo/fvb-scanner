@@ -69,6 +69,8 @@ def build_email_body(fresh_weeks: int = 12) -> str:
     else:
         for _, r in fresh.iterrows():
             thin_warn = "\n  ** THIN BAND SAMPLE — verify on TradingView Monthly chart before acting **" if r.get("thin_sample") else ""
+            struct_tag = r.get("daily_structure", "INSUFFICIENT")
+            struct_warn = f"\n  Daily structure: {struct_tag}" if struct_tag != "INSUFFICIENT" else ""
             lines.append(
                 f"\n{r['ticker']}\n"
                 f"  Entered {r['entry_date']} ({r['weeks_held']}wks ago)\t"
@@ -77,6 +79,7 @@ def build_email_body(fresh_weeks: int = 12) -> str:
                 f"{r['hist_win_rate']:.1f}% win, {r['hist_expectancy']:+.1f}% exp.\t"
                 f"R/R {r['risk_reward']}"
                 f"{thin_warn}"
+                f"{struct_warn}"
             )
 
     positions = small_cap_positions.load()

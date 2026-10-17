@@ -51,6 +51,11 @@ def scan_ticker(tk: str, fresh_weeks: int):
                                          "Low": "min", "Close": "last"}).dropna()
     straddle_n = bt.straddle_sample_size(m_monthly, bt.FVB_LEN)
 
+    # [DAILY STRUCTURE TAG] separate daily fetch, used only for this
+    # confidence tag — does not affect entry/exit/trade logic above.
+    daily = bt.fetch_daily(tk)
+    daily_structure = bt.daily_structure_tag(daily)
+
     # [PERFORMANCE FIX] this used to call bt.run() for historical stats AND
     # ALSO run a separate, near-identical loop below to track the live
     # position — simulating the entire history TWICE per ticker for no
@@ -113,6 +118,7 @@ def scan_ticker(tk: str, fresh_weeks: int):
         "hist_pf": hist_stats["pf"],
         "straddle_sample": straddle_n,
         "thin_sample": straddle_n < 75,
+        "daily_structure": daily_structure,
     }
     # [RATING] transparent, not a black-box score — just a plain-language
     # read of this ticker's OWN track record under this exact strategy.
