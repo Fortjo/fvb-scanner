@@ -82,10 +82,14 @@ def scan_ticker(tk: str, fresh_weeks: int):
             elif not green[i]:
                 exit_px, reason = cl[i], "STOP"
             if exit_px is not None:
+                # [DRAWDOWN EXPECTATION] worst weekly-close drawdown from
+                # entry price during this trade's life — same MAE metric
+                # used in the standalone drawdown research. Diagnostic only.
+                mae = (cl[entry_i:i + 1] / entry_px - 1).min() * 100
                 hist_trades.append({
                     "entry_date": idx[entry_i], "exit_date": idx[i],
                     "ret": exit_px / entry_px - 1 - bt.RT_COST,
-                    "hold": i - entry_i, "reason": reason,
+                    "hold": i - entry_i, "reason": reason, "mae": mae,
                 })
                 in_pos = False
                 continue
@@ -103,6 +107,9 @@ def scan_ticker(tk: str, fresh_weeks: int):
     # on a ticker that's won 90% of its past trades is a very different
     # thing from a fresh signal on one that's been a coin flip.
     hist_stats = bt.stats(hist_trades)
+    hist_maes = [t["mae"] for t in hist_trades if "mae" in t]
+    hist_median_dd = float(np.median(hist_maes)) if hist_maes else np.nan
+    hist_worst_dd = float(np.min(hist_maes)) if hist_maes else np.nan
 
     last_i = len(df) - 1
     result = {
@@ -119,6 +126,8 @@ def scan_ticker(tk: str, fresh_weeks: int):
         "straddle_sample": straddle_n,
         "thin_sample": straddle_n < 75,
         "daily_structure": daily_structure,
+        "hist_median_dd": hist_median_dd,
+        "hist_worst_dd": hist_worst_dd,
     }
     # [RATING] transparent, not a black-box score — just a plain-language
     # read of this ticker's OWN track record under this exact strategy.

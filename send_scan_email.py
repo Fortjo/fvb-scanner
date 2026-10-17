@@ -59,6 +59,9 @@ def build_email_body(fresh_weeks: int = 12) -> str:
             lines.append(f"  Entered {row['entry_date']} ({row['weeks_held']:.0f} wks ago), open P&L {row['open_pl_pct']:+.1f}%")
             lines.append(f"  History: {row['hist_trades']:.0f} trades, {row['hist_win_rate']:.1f}% win rate, "
                           f"{row['hist_expectancy']:+.1f}% expectancy/trade")
+            dd_med, dd_worst = row.get("hist_median_dd"), row.get("hist_worst_dd")
+            if pd.notna(dd_med):
+                lines.append(f"  Typical drawdown before resolving: {dd_med:.1f}% (worst {dd_worst:.1f}%)")
             lines.append(f"  Risk/reward from here: {rr_str}{below_warn}{thin_warn}")
             if struct_line:
                 lines.append(struct_line)
@@ -97,7 +100,8 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int) -> str:
           <td style="padding:8px;border-bottom:1px solid #ddd;color:{pl_color};font-weight:bold;">
               {row['open_pl_pct']:+.1f}%</td>
           <td style="padding:8px;border-bottom:1px solid #ddd;">{row['hist_trades']:.0f} trades<br>
-              <span style="color:#666;font-size:12px;">{row['hist_win_rate']:.1f}% win, {row['hist_expectancy']:+.1f}% exp.</span></td>
+              <span style="color:#666;font-size:12px;">{row['hist_win_rate']:.1f}% win, {row['hist_expectancy']:+.1f}% exp.<br>
+              {('Typical DD ' + format(row['hist_median_dd'], '.1f') + '% (worst ' + format(row['hist_worst_dd'], '.1f') + '%)') if pd.notna(row.get('hist_median_dd')) else ''}</span></td>
           <td style="padding:8px;border-bottom:1px solid #ddd;">{rr_str}{below_warn}{thin_warn}{struct_html}</td>
         </tr>""")
 
