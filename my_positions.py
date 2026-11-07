@@ -39,8 +39,32 @@ ACCOUNT_STATE_FILE = "account_state.csv"
 # itself; only an explicit edit (from a reported fill) does.
 #
 # Expected format:  cash,slots
-#   cash  = uninvested dollars sitting in the account right now
+#   cash  = uninvested EUR sitting in the account right now (your
+#           Trading 212 account currency)
 #   slots = how many concurrent positions you want FVB money spread across
+#
+# CURRENCY: cash is EUR, but every entry_price/position_size in
+# my_positions.csv is a real USD stock price (LIN, HCA, etc. all trade
+# on US exchanges) — so every position's current value gets converted
+# USD->EUR via a live FX rate before it's added to EUR cash. Everything
+# this module reports (equity, per-slot, suggested buy) is in EUR.
+
+
+def _eur_usd_rate():
+    """USD per 1 EUR, fetched live (same yfinance path as every ticker
+    fetch in this project). Falls back to a fixed approximate rate if
+    the fetch fails — flagged via the second tuple element (False =
+    approximate, not live) so the email can say so instead of silently
+    using a stale number."""
+    try:
+        raw = bt.fetch("EURUSD=X")
+        if raw is not None and len(raw) > 0:
+            rate = float(raw["Close"].values[-1])
+            if rate > 0:
+                return rate, True
+    except Exception:
+        pass
+    return 1.08, False  # rough fallback only — real rate drifts over time
 
 
 def load_account_state():
@@ -60,20 +84,24 @@ def load_account_state():
 def compute_account_summary():
     """Returns None if account_state.csv doesn't exist yet (sizing section
     is simply skipped from the email in that case — same pattern as the
-    missing-my_positions.csv fallback below). Otherwise returns:
-        cash, slots, open_count, equity, per_slot_dollar,
-        available_slots, suggested_buy_dollar
-    Open positions are marked at TODAY'S price (not entry price) to get a
-    real current equity figure, same price fetch build_positions_section()
-    already does — if a ticker's price can't be fetched this week, that
-    one position falls back to its own cost basis so equity never goes
-    stale/wrong from a single bad fetch.
+    missing-my_positions.csv fallback below). Otherwise returns, all in
+    EUR:
+        cash, slots, open_count, equity, per_slot_eur,
+        available_slots, suggested_buy_eur, fx_rate, fx_live
+    Open positions are marked at TODAY'S USD price (not entry price) to
+    get a real current equity figure, same price fetch
+    build_positions_section() already does, then converted to EUR via
+    the live EUR/USD rate — if a ticker's price can't be fetched this
+    week, that one position falls back to its own USD cost basis so
+    equity never goes stale/wrong from a single bad fetch.
     """
     state = load_account_state()
     if state is None:
         return None
 
-    equity = state["cash"]
+    fx_rate, fx_live = _eur_usd_rate()  # USD per 1 EUR
+
+    equity = state["cash"]  # EUR
     open_count = 0
     open_df = load_open_positions()
     if open_df is not None and len(open_df) > 0:
@@ -85,33 +113,35 @@ def compute_account_summary():
             except (ValueError, TypeError):
                 continue
             open_count += 1
-            mark = position_size  # fallback: cost basis
+            mark_usd = position_size  # fallback: USD cost basis
             try:
                 raw = bt.fetch(tk)
                 if raw is not None:
                     df = bt.prep(raw)
                     if len(df) > 0:
                         current_price = df["Close"].values[-1]
-                        mark = position_size * (current_price / entry_price)
+                        mark_usd = position_size * (current_price / entry_price)
             except Exception:
                 pass
-            equity += mark
+            equity += mark_usd / fx_rate  # USD -> EUR
 
     slots = state["slots"]
-    per_slot_dollar = equity / slots if slots > 0 else np.nan
+    per_slot_eur = equity / slots if slots > 0 else np.nan
     available_slots = max(slots - open_count, 0)
-    suggested_buy_dollar = np.nan
-    if not np.isnan(per_slot_dollar):
-        suggested_buy_dollar = max(min(per_slot_dollar, state["cash"]), 0.0)
+    suggested_buy_eur = np.nan
+    if not np.isnan(per_slot_eur):
+        suggested_buy_eur = max(min(per_slot_eur, state["cash"]), 0.0)
 
     return {
         "cash": state["cash"],
         "slots": slots,
         "open_count": open_count,
         "equity": equity,
-        "per_slot_dollar": per_slot_dollar,
+        "per_slot_eur": per_slot_eur,
         "available_slots": available_slots,
-        "suggested_buy_dollar": suggested_buy_dollar,
+        "suggested_buy_eur": suggested_buy_eur,
+        "fx_rate": fx_rate,
+        "fx_live": fx_live,
     }
 
 

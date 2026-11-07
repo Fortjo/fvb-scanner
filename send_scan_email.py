@@ -50,9 +50,10 @@ def build_email_body(fresh_weeks: int = 12) -> str:
     lines = []
     lines.append(f"Weekly 33FVB scan — {len(df)} tickers checked, {len(fresh)} fresh buy signals\n")
     if acct is not None:
-        lines.append(f"Account: equity ${acct['equity']:.2f} | cash ${acct['cash']:.2f} | "
+        fx_note = "" if acct["fx_live"] else "  ** FX rate fetch failed, using approx rate **"
+        lines.append(f"Account: equity €{acct['equity']:.2f} | cash €{acct['cash']:.2f} | "
                       f"{acct['open_count']}/{acct['slots']} slots used | "
-                      f"per-slot ${acct['per_slot_dollar']:.2f}\n")
+                      f"per-slot €{acct['per_slot_eur']:.2f}{fx_note}\n")
     lines.append("=" * 70)
 
     if len(fresh) == 0:
@@ -77,7 +78,7 @@ def build_email_body(fresh_weeks: int = 12) -> str:
                 lines.append(struct_line)
             if acct is not None:
                 if acct["available_slots"] > 0:
-                    lines.append(f"  Suggested buy size: ${acct['suggested_buy_dollar']:.2f} "
+                    lines.append(f"  Suggested buy size: €{acct['suggested_buy_eur']:.2f} "
                                   f"({acct['available_slots']} slot(s) free)")
                 else:
                     lines.append("  ** NO FREE SLOT — all slots full, would need to close a position first **")
@@ -114,7 +115,7 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int, acct: dict = 
         if acct is not None:
             if acct["available_slots"] > 0:
                 size_cell = (f'<td style="padding:8px;border-bottom:1px solid #ddd;color:#1a7a1a;font-weight:bold;">'
-                             f'${acct["suggested_buy_dollar"]:.2f}</td>')
+                             f'&euro;{acct["suggested_buy_eur"]:.2f}</td>')
             else:
                 size_cell = ('<td style="padding:8px;border-bottom:1px solid #ddd;color:#c0392b;font-weight:bold;">'
                              'no free slot</td>')
@@ -154,10 +155,12 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int, acct: dict = 
 
     acct_html = ""
     if acct is not None:
+        fx_warn_html = ('<br><span style="color:#c0392b;">&#9888; FX rate fetch failed, using approx rate</span>'
+                         ) if not acct["fx_live"] else ""
         acct_html = f"""
         <p style="background-color:#f0f4f8;padding:8px 12px;border-radius:4px;font-size:13px;color:#333;">
-          <b>Account:</b> equity ${acct['equity']:.2f} &nbsp;|&nbsp; cash ${acct['cash']:.2f} &nbsp;|&nbsp;
-          {acct['open_count']}/{acct['slots']} slots used &nbsp;|&nbsp; per-slot ${acct['per_slot_dollar']:.2f}
+          <b>Account:</b> equity &euro;{acct['equity']:.2f} &nbsp;|&nbsp; cash &euro;{acct['cash']:.2f} &nbsp;|&nbsp;
+          {acct['open_count']}/{acct['slots']} slots used &nbsp;|&nbsp; per-slot &euro;{acct['per_slot_eur']:.2f}{fx_warn_html}
         </p>"""
 
     html = f"""
