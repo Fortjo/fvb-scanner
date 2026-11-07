@@ -41,8 +41,18 @@ def build_email_body(fresh_weeks: int = 12) -> str:
     longs = longs[~longs["ticker"].str.upper().isin(held_tickers)]
     fresh = longs[longs["fresh"]].sort_values("hist_expectancy", ascending=False)
 
+    # [POSITION SIZING] honor-system balance from account_state.csv — you
+    # tell me a fill, I update cash there, and this suggests a $ amount
+    # for each fresh signal from current equity / your slot count (capped
+    # by actual cash on hand). Silently skipped if that file isn't set up.
+    acct = my_positions.compute_account_summary()
+
     lines = []
     lines.append(f"Weekly 33FVB scan — {len(df)} tickers checked, {len(fresh)} fresh buy signals\n")
+    if acct is not None:
+        lines.append(f"Account: equity ${acct['equity']:.2f} | cash ${acct['cash']:.2f} | "
+                      f"{acct['open_count']}/{acct['slots']} slots used | "
+                      f"per-slot ${acct['per_slot_dollar']:.2f}\n")
     lines.append("=" * 70)
 
     if len(fresh) == 0:
@@ -65,6 +75,12 @@ def build_email_body(fresh_weeks: int = 12) -> str:
             lines.append(f"  Risk/reward from here: {rr_str}{below_warn}{thin_warn}")
             if struct_line:
                 lines.append(struct_line)
+            if acct is not None:
+                if acct["available_slots"] > 0:
+                    lines.append(f"  Suggested buy size: ${acct['suggested_buy_dollar']:.2f} "
+                                  f"({acct['available_slots']} slot(s) free)")
+                else:
+                    lines.append("  ** NO FREE SLOT — all slots full, would need to close a position first **")
 
     lines.append(my_positions.build_positions_section())
     lines.append(my_positions.build_closed_positions_section())
@@ -72,13 +88,16 @@ def build_email_body(fresh_weeks: int = 12) -> str:
     lines.append("\n" + "=" * 70)
     lines.append("Full data attached as CSV. Reminder: this is historical backtest")
     lines.append("performance, not a guarantee — check each chart before acting.")
-    return "\n".join(lines), fresh, len(df)
+    return "\n".join(lines), fresh, len(df), acct
 
 
-def build_email_body_html(fresh: pd.DataFrame, total_checked: int) -> str:
+def build_email_body_html(fresh: pd.DataFrame, total_checked: int, acct: dict = None) -> str:
     """HTML version of the fresh-signals section, plus the HTML position/
     closed-trade tables from my_positions.py. Same underlying data as the
-    plain-text version — just formatted for an actual email client."""
+    plain-text version — just formatted for an actual email client.
+    `acct` is the dict from my_positions.compute_account_summary() (or
+    None if account_state.csv isn't set up — sizing column is just left
+    out of the table in that case)."""
     rows_html = []
     for _, row in fresh.iterrows():
         rr = row["risk_reward"]
@@ -91,6 +110,14 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int) -> str:
         struct_html = (f'<br><span style="color:{struct_colors.get(struct_tag,"#555")};">'
                        f'Daily structure: {struct_tag}</span>') if struct_tag != "INSUFFICIENT" else ""
         pl_color = "#1a7a1a" if row["open_pl_pct"] >= 0 else "#c0392b"
+        size_cell = ""
+        if acct is not None:
+            if acct["available_slots"] > 0:
+                size_cell = (f'<td style="padding:8px;border-bottom:1px solid #ddd;color:#1a7a1a;font-weight:bold;">'
+                             f'${acct["suggested_buy_dollar"]:.2f}</td>')
+            else:
+                size_cell = ('<td style="padding:8px;border-bottom:1px solid #ddd;color:#c0392b;font-weight:bold;">'
+                             'no free slot</td>')
         rows_html.append(f"""
         <tr>
           <td style="padding:8px;border-bottom:1px solid #ddd;"><b>{row['ticker']}</b><br>
@@ -103,7 +130,10 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int) -> str:
               <span style="color:#666;font-size:12px;">{row['hist_win_rate']:.1f}% win, {row['hist_expectancy']:+.1f}% exp.<br>
               {('Typical DD ' + format(row['hist_median_dd'], '.1f') + '% (worst ' + format(row['hist_worst_dd'], '.1f') + '%)') if pd.notna(row.get('hist_median_dd')) else ''}</span></td>
           <td style="padding:8px;border-bottom:1px solid #ddd;">{rr_str}{below_warn}{thin_warn}{struct_html}</td>
+          {size_cell}
         </tr>""")
+
+    size_header = '<th style="padding:8px;text-align:left;">Suggested buy</th>' if acct is not None else ""
 
     fresh_table = ""
     if len(fresh) == 0:
@@ -117,15 +147,25 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int) -> str:
             <th style="padding:8px;text-align:left;">Open P&amp;L</th>
             <th style="padding:8px;text-align:left;">History</th>
             <th style="padding:8px;text-align:left;">Risk/Reward</th>
+            {size_header}
           </tr>
           {"".join(rows_html)}
         </table>"""
+
+    acct_html = ""
+    if acct is not None:
+        acct_html = f"""
+        <p style="background-color:#f0f4f8;padding:8px 12px;border-radius:4px;font-size:13px;color:#333;">
+          <b>Account:</b> equity ${acct['equity']:.2f} &nbsp;|&nbsp; cash ${acct['cash']:.2f} &nbsp;|&nbsp;
+          {acct['open_count']}/{acct['slots']} slots used &nbsp;|&nbsp; per-slot ${acct['per_slot_dollar']:.2f}
+        </p>"""
 
     html = f"""
     <html><body style="font-family:Arial,sans-serif;color:#222;max-width:800px;margin:0 auto;">
       <h1 style="font-size:20px;border-bottom:2px solid #333;padding-bottom:8px;">
         Weekly 33FVB Scan — {total_checked} tickers checked, {len(fresh)} fresh buy signals
       </h1>
+      {acct_html}
       {fresh_table}
       {my_positions.build_positions_section_html()}
       {my_positions.build_closed_positions_section_html()}
@@ -167,7 +207,7 @@ def send_email(body: str, html_body: str):
 
 
 if __name__ == "__main__":
-    body, fresh, total_checked = build_email_body()
-    html_body = build_email_body_html(fresh, total_checked)
+    body, fresh, total_checked, acct = build_email_body()
+    html_body = build_email_body_html(fresh, total_checked, acct)
     print(body)  # also visible in the GitHub Actions log
     send_email(body, html_body)
