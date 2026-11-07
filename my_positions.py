@@ -15,6 +15,17 @@ import numpy as np
 import pandas as pd
 import backtest_33fvb as bt
 
+
+def parse_date(s):
+    """my_positions.csv uses DD.MM.YYYY. pd.Timestamp() would read
+    01.09.2026 as Jan 9 — parse the day-first format explicitly, and
+    fall back to pandas for anything else (e.g. ISO 2026-09-01)."""
+    s = str(s).strip()
+    try:
+        return pd.to_datetime(s, format="%d.%m.%Y")
+    except ValueError:
+        return pd.Timestamp(s)
+
 POSITIONS_FILE = "my_positions.csv"
 STALE_MULTIPLIER = 1.5  # flag a position if it's held this many times longer
                         # than that ticker's own historical average hold
@@ -63,7 +74,7 @@ def compute_entry_tp_target(df: pd.DataFrame, entry_date, entry_price: float):
     high before entry. Fixed once at entry — not recomputed every week,
     same principle as the live engine fix."""
     idx = df.index
-    entry_ts = pd.Timestamp(entry_date)
+    entry_ts = parse_date(entry_date)
     after = df.index[df.index >= entry_ts]
     if len(after) == 0:
         return np.nan
@@ -157,7 +168,7 @@ def build_positions_section():
 
         weeks_held = None
         try:
-            entry_dt = pd.Timestamp(row["entry_date"])
+            entry_dt = parse_date(row["entry_date"])
             weeks_held = int((df.index[-1] - entry_dt).days / 7)
         except Exception:
             pass
@@ -227,8 +238,8 @@ def build_closed_positions_section():
 
         held = "?"
         try:
-            entry_dt = pd.Timestamp(row["entry_date"])
-            exit_dt = pd.Timestamp(row["exit_date"])
+            entry_dt = parse_date(row["entry_date"])
+            exit_dt = parse_date(row["exit_date"])
             held = int((exit_dt - entry_dt).days / 7)
         except Exception:
             pass
@@ -301,7 +312,7 @@ def build_positions_section_html():
 
         weeks_held = None
         try:
-            entry_dt = pd.Timestamp(row["entry_date"])
+            entry_dt = parse_date(row["entry_date"])
             weeks_held = int((df.index[-1] - entry_dt).days / 7)
         except Exception:
             pass
@@ -399,8 +410,8 @@ def build_closed_positions_section_html():
 
         held = "?"
         try:
-            entry_dt = pd.Timestamp(row["entry_date"])
-            exit_dt = pd.Timestamp(row["exit_date"])
+            entry_dt = parse_date(row["entry_date"])
+            exit_dt = parse_date(row["exit_date"])
             held = int((exit_dt - entry_dt).days / 7)
         except Exception:
             pass
