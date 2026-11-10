@@ -22,9 +22,12 @@ import pandas as pd
 import scan_current_buys as scb
 import backtest_33fvb as bt
 import my_positions
+import market_regime
 
 
-def build_email_body(fresh_weeks: int = 12) -> str:
+def build_email_body(fresh_weeks: int = 12, regime_info: dict = None) -> str:
+    if regime_info is None:
+        regime_info = market_regime.get_market_regime()
     rows = []
     for tk in bt.UNIVERSE:
         r = scb.scan_ticker(tk, fresh_weeks)
@@ -49,6 +52,7 @@ def build_email_body(fresh_weeks: int = 12) -> str:
 
     lines = []
     lines.append(f"Weekly 33FVB scan — {len(df)} tickers checked, {len(fresh)} fresh buy signals\n")
+    lines.append(market_regime.regime_banner_text(regime_info) + "\n")
     if acct is not None:
         fx_note = "" if acct["fx_live"] else "  ** FX rate fetch failed, using approx rate **"
         lines.append(f"Account: equity €{acct['equity']:.2f} | cash €{acct['cash']:.2f} | "
@@ -89,10 +93,11 @@ def build_email_body(fresh_weeks: int = 12) -> str:
     lines.append("\n" + "=" * 70)
     lines.append("Full data attached as CSV. Reminder: this is historical backtest")
     lines.append("performance, not a guarantee — check each chart before acting.")
-    return "\n".join(lines), fresh, len(df), acct
+    return "\n".join(lines), fresh, len(df), acct, regime_info
 
 
-def build_email_body_html(fresh: pd.DataFrame, total_checked: int, acct: dict = None) -> str:
+def build_email_body_html(fresh: pd.DataFrame, total_checked: int, acct: dict = None,
+                           regime_info: dict = None) -> str:
     """HTML version of the fresh-signals section, plus the HTML position/
     closed-trade tables from my_positions.py. Same underlying data as the
     plain-text version — just formatted for an actual email client.
@@ -153,6 +158,10 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int, acct: dict = 
           {"".join(rows_html)}
         </table>"""
 
+    regime_html = ""
+    if regime_info is not None:
+        regime_html = market_regime.regime_banner_html(regime_info)
+
     acct_html = ""
     if acct is not None:
         fx_warn_html = ('<br><span style="color:#c0392b;">&#9888; FX rate fetch failed, using approx rate</span>'
@@ -168,6 +177,7 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int, acct: dict = 
       <h1 style="font-size:20px;border-bottom:2px solid #333;padding-bottom:8px;">
         Weekly 33FVB Scan — {total_checked} tickers checked, {len(fresh)} fresh buy signals
       </h1>
+      {regime_html}
       {acct_html}
       {fresh_table}
       {my_positions.build_positions_section_html()}
@@ -210,7 +220,8 @@ def send_email(body: str, html_body: str):
 
 
 if __name__ == "__main__":
-    body, fresh, total_checked, acct = build_email_body()
-    html_body = build_email_body_html(fresh, total_checked, acct)
+    regime_info = market_regime.get_market_regime()
+    body, fresh, total_checked, acct, regime_info = build_email_body(regime_info=regime_info)
+    html_body = build_email_body_html(fresh, total_checked, acct, regime_info)
     print(body)  # also visible in the GitHub Actions log
     send_email(body, html_body)
