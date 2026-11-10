@@ -5,7 +5,8 @@ monthly-indicator timing bugs in backtest_33fvb.prep() WITHOUT touching
 the strategy's entry/exit/band logic itself. backtest_33fvb.py is left
 completely UNCHANGED and stays the benchmark; this script builds a
 parallel, corrected indicator pipeline and compares the two side by
-side on several real tickers, plus runs explicit no-lookahead tests.
+side on the full real universe, plus runs explicit point-in-time and
+future-mutation no-lookahead tests.
 
 Two bugs fixed here (audit items #5 and #6):
 
@@ -31,31 +32,28 @@ Two bugs fixed here (audit items #5 and #6):
      its own (a given week can only ffill-pick a monthly row whose own
      label date is <= that week, i.e. a COMPLETED month) -- the .shift(1)
      is redundant and is what introduces the extra month of staleness.
-     Removing it restores the intended "last completed month, no more
-     and no less" semantic, with an explicit assertion (below) proving
-     no future bar ever enters a decision.
 
 What's NOT fixed here (flagged for Milestone B, not silently skipped):
   - audit item #4/#7: weekly-bar intrabar TP/STOP/entry fill ordering
-    ambiguity in run() itself (which of High/Low/Open "happened first"
-    within one weekly bar). That needs a full daily-level execution
-    reconstruction of run(), which is a bigger undertaking than the
-    indicator-timing fix here -- deferred to Milestone B.
+    ambiguity in run() itself. Needs a full daily-level execution
+    reconstruction, a bigger undertaking than the indicator-timing fix
+    here. See the yfinance timestamp-convention findings below, which
+    narrow down (but don't fully resolve) part of this ambiguity.
   - audit item #2: survivorship-biased universe (current index members
-    applied to 1970s-present history). Deferred -- would need a point-
-    in-time constituent history data source.
-  - audit item #3: the --split train/test selection in main()'s
-    "PLAIN-ENGLISH READOUT" picks the best band/exit combo by looking at
-    test-segment performance, which is a form of leakage if that
-    selection ever informed which config got deployed live. Flagged,
-    not fixed here -- Milestone A freezes the baseline config (band=
-    High, exit=NBarHigh) as given, per your instruction, rather than
-    re-selecting it.
+    applied to 1970s-present history). Deferred -- needs point-in-time
+    constituent history data.
+  - audit item #3: the --split train/test selection leakage in main()'s
+    readout. Not touched; the live config (band=High, exit=NBarHigh) was
+    frozen as given, per instruction, rather than re-selected.
 
 Usage (run locally -- needs yfinance):
+    python3 milestone_a_engine_fix.py --synthetic
+        # no-network: point-in-time recompute test + future-mutation test
     python3 milestone_a_engine_fix.py
+        # full bt.UNIVERSE (170 tickers) + 17-ETF basket, both UNFILTERED
+        # and 60-month-warm-up-filtered comparisons, saved separately
     python3 milestone_a_engine_fix.py --tickers MSFT,AAPL,ORCL,SOFI,XEL
-    python3 milestone_a_engine_fix.py --synthetic   # no-network lookahead test only
+        # a specific subset instead of the full universe
 """
 import argparse
 import sys
@@ -63,7 +61,8 @@ import numpy as np
 import pandas as pd
 import backtest_33fvb as bt
 
-TEST_TICKERS_DEFAULT = ["MSFT", "AAPL", "ORCL", "SOFI", "XEL", "WMT", "NVDA"]
+ETF_BASKET = ["SPY", "QQQ", "IWM", "XLB", "XLE", "XLF", "XLI", "XLK", "XLP",
+              "XLU", "XLV", "XLY", "EFA", "EEM", "TLT", "IEF", "GLD"]
 
 
 # --------------------------------------------------------------- new prep
@@ -81,10 +80,6 @@ def prep_v2(df_weekly: pd.DataFrame, df_daily: pd.DataFrame) -> pd.DataFrame:
     basis = ohlc4.rolling(bt.FVB_LEN).mean()
     monthly = pd.DataFrame({"basis": basis, "upperR": upperR, "lowerR": lowerR,
                              "green": green})
-    # NO .shift(1) here -- see fix #6 above. reindex+ffill alone is already
-    # lookahead-safe: a weekly bar dated t can only pick up a monthly row
-    # whose own index label (a month-END date) is <= t, i.e. an already-
-    # completed month.
     out = df_weekly.copy()
     mm = monthly.reindex(df_weekly.index, method="ffill")
     out[["basis", "upperR", "lowerR", "green"]] = mm
@@ -103,16 +98,10 @@ def prep_v2(df_weekly: pd.DataFrame, df_daily: pd.DataFrame) -> pd.DataFrame:
     return out.dropna(subset=["basis"]), monthly
 
 
-# --------------------------------------------------------- no-lookahead test
-def test_no_lookahead():
-    """Synthetic daily+weekly series. For every weekly decision bar,
-    assert the monthly row actually used (per mm.reindex(...).asof-style
-    lookup) comes from a month whose own last trading day is STRICTLY
-    BEFORE that weekly bar's date -- i.e. no future information, and
-    (unlike the original) no MORE than one month of unnecessary extra
-    staleness either."""
-    rng = np.random.default_rng(42)
-    daily_idx = pd.date_range("2015-01-01", periods=3000, freq="B")
+# --------------------------------------------------- synthetic data builder
+def _make_synthetic(n_days=4000, seed=42, start="2010-01-01"):
+    rng = np.random.default_rng(seed)
+    daily_idx = pd.date_range(start, periods=n_days, freq="B")
     close = 50 * np.exp(np.cumsum(rng.normal(0.0004, 0.015, len(daily_idx))))
     daily = pd.DataFrame({
         "Open": close * (1 + rng.normal(0, 0.003, len(daily_idx))),
@@ -122,81 +111,166 @@ def test_no_lookahead():
     }, index=daily_idx)
     weekly = daily.resample("W-FRI").agg({"Open": "first", "High": "max",
                                            "Low": "min", "Close": "last"}).dropna()
+    return daily, weekly
 
-    _, monthly = prep_v2(weekly, daily)
-    # monthly index = month-end label = last day that month's row could
-    # possibly reflect. For every weekly bar, whatever monthly row ffill
-    # assigned it must have a label strictly before the weekly bar's date,
-    # AND must be the MOST RECENT such completed month (no extra lag).
-    violations, stale_by_2 = 0, 0
-    monthly_labels = monthly.index
-    # what prep_v2's own reindex+ffill actually assigns to each weekly bar:
-    mm_actual = monthly.reindex(weekly.index, method="ffill")
-    for wk_date in weekly.index:
-        # "most recently completed" uses the SAME tie convention as a
-        # correct ffill pick (<=): a month-end landing on this exact
-        # trading day is same-bar information, not future information.
-        eligible = monthly_labels[monthly_labels <= wk_date]
-        if len(eligible) == 0:
+
+# ----------------------------------------------- TEST 1: point-in-time recompute
+def test_point_in_time_recompute():
+    """The real test the audit asked for: for sampled historical decision
+    dates, TRUNCATE the raw daily+weekly input data to only what was
+    available by that date, rerun prep_v2() FROM SCRATCH on the truncated
+    input, and compare the resulting LAST indicator value against what
+    the full-history run produces at that same weekly bar. This exercises
+    the actual _compute_real_fvb() causality (sequential median/state
+    tracking), not just the reindex/ffill alignment -- a vectorized bug
+    (e.g. an accidental centered rolling window) would be caught here but
+    would NOT necessarily be caught by a pure alignment check.
+
+    Explicit boundary cases included, not just evenly-spaced samples:
+      - a decision date that IS itself a month-end Friday
+      - a decision date whose underlying week's trading days span two
+        different calendar months (the exact condition fix #5 targets)
+    """
+    daily, weekly = _make_synthetic(n_days=4000, seed=42)
+    full_new, _ = prep_v2(weekly, daily)
+
+    # evenly spaced samples, skipping the first chunk (no indicator yet)
+    candidates = list(weekly.index[60::15])
+
+    # explicit boundary case 1: a weekly bar landing in the last 3 days of
+    # its calendar month (closest thing to "month-end Friday" in this
+    # synthetic W-FRI series)
+    month_end_candidates = [d for d in weekly.index if d.day >= d.days_in_month - 2]
+    if month_end_candidates:
+        candidates.append(month_end_candidates[len(month_end_candidates) // 2])
+
+    # explicit boundary case 2: a week whose own trading days span two
+    # different calendar months
+    boundary_weeks = []
+    prev = None
+    for d in weekly.index:
+        week_days = daily.index[(daily.index > (prev if prev is not None else d - pd.Timedelta(days=7)))
+                                 & (daily.index <= d)]
+        if len(week_days) and week_days.min().month != week_days.max().month:
+            boundary_weeks.append(d)
+        prev = d
+    if boundary_weeks:
+        candidates.append(boundary_weeks[len(boundary_weeks) // 2])
+
+    candidates = sorted(set(candidates))
+    mismatches = []
+    for d in candidates:
+        if d not in full_new.index:
             continue
-        most_recent_completed = eligible[-1]
-        if most_recent_completed > wk_date:
-            violations += 1  # used a month that hadn't completed yet -- lookahead
-        actual_basis = mm_actual.loc[wk_date, "basis"]
-        expected_basis = monthly.loc[most_recent_completed, "basis"]
-        both_nan = pd.isna(actual_basis) and pd.isna(expected_basis)
-        # "stale by 2" = the value ACTUALLY used by prep_v2 differs from
-        # the value of the truly most-recently-completed month (i.e. an
-        # extra month of lag is sneaking in somewhere)
-        if not both_nan and (pd.isna(actual_basis) != pd.isna(expected_basis)
-                              or abs(actual_basis - expected_basis) > 1e-9):
-            stale_by_2 += 1
+        daily_trunc = daily[daily.index <= d]
+        weekly_trunc = weekly[weekly.index <= d]
+        if len(weekly_trunc) < bt.FVB_LEN:
+            continue
+        try:
+            trunc_new, _ = prep_v2(weekly_trunc, daily_trunc)
+        except Exception as e:
+            mismatches.append((d, f"ERROR recomputing on truncated data: {e}"))
+            continue
+        if d not in trunc_new.index:
+            mismatches.append((d, "truncated run dropped this bar entirely (insufficient warmup)"))
+            continue
+        full_row = full_new.loc[d]
+        trunc_row = trunc_new.loc[d]
+        for col in ["basis", "upperR", "lowerR", "green"]:
+            fv, tv = full_row[col], trunc_row[col]
+            if pd.isna(fv) and pd.isna(tv):
+                continue
+            if col == "green":
+                if bool(fv) != bool(tv):
+                    mismatches.append((d, f"{col}: full={fv} truncated={tv}"))
+            elif pd.isna(fv) != pd.isna(tv) or abs(fv - tv) > 1e-9:
+                mismatches.append((d, f"{col}: full={fv} truncated={tv}"))
 
-    print(f"no-lookahead test: {violations} lookahead violations "
-          f"(must be 0) across {len(weekly)} weekly decision bars")
-    print(f"staleness check: {stale_by_2} weekly bars used a month OTHER than "
-          f"the most recently completed one (must be 0 -- any >0 means the "
-          f"extra-lag bug is still present)")
-    assert violations == 0, "LOOKAHEAD DETECTED -- fix is broken"
-    assert stale_by_2 == 0, "EXTRA LAG STILL PRESENT -- fix #6 did not work"
-    print("PASSED: no lookahead, no extra staleness.\n")
+    print(f"point-in-time recompute test: {len(candidates)} decision dates checked "
+          f"(including month-end and month-boundary-crossing weeks)")
+    if mismatches:
+        print(f"  FAILED: {len(mismatches)} mismatches:")
+        for d, msg in mismatches[:20]:
+            print(f"    {d.date()}: {msg}")
+        raise AssertionError("point-in-time recompute test failed -- see mismatches above")
+    print("  PASSED: every sampled decision date's indicator value is IDENTICAL whether "
+          "computed on the full history or on data truncated to that date.\n")
+
+
+# ----------------------------------------------- TEST 2: future mutation
+def test_future_mutation():
+    """Stronger, more direct proof than test 1: compute the full pipeline
+    once, note the indicator value at a chosen decision date, then VIOLENTLY
+    MUTATE every bar strictly after that date (10x price shock) and
+    recompute the full pipeline again. If the decision date's own indicator
+    value changes AT ALL, that is lookahead, full stop -- no interpretation
+    needed."""
+    daily, weekly = _make_synthetic(n_days=4000, seed=43)
+    full_new, _ = prep_v2(weekly, daily)
+
+    # pick a decision date with plenty of history before AND after it
+    d = weekly.index[int(len(weekly) * 0.7)]
+    baseline = full_new.loc[d, ["basis", "upperR", "lowerR", "green"]].copy()
+
+    daily_mut = daily.copy()
+    mask = daily_mut.index > d
+    for col in ["Open", "High", "Low", "Close"]:
+        daily_mut.loc[mask, col] = daily_mut.loc[mask, col] * 10.0 + 500.0
+    weekly_mut = daily_mut.resample("W-FRI").agg({"Open": "first", "High": "max",
+                                                   "Low": "min", "Close": "last"}).dropna()
+    mut_new, _ = prep_v2(weekly_mut, daily_mut)
+    mutated = mut_new.loc[d, ["basis", "upperR", "lowerR", "green"]]
+
+    print(f"future-mutation test: decision date {d.date()}, "
+          f"all bars after it shocked 10x+500 in price")
+    mismatches = []
+    for col in ["basis", "upperR", "lowerR", "green"]:
+        bv, mv = baseline[col], mutated[col]
+        if col == "green":
+            if bool(bv) != bool(mv):
+                mismatches.append(col)
+        elif abs(bv - mv) > 1e-9:
+            mismatches.append(col)
+    if mismatches:
+        print(f"  FAILED: {mismatches} changed after mutating ONLY future data -- lookahead present")
+        raise AssertionError(f"future-mutation test failed: {mismatches} leaked future information")
+    print("  PASSED: decision date's indicator value is bit-for-bit unchanged despite "
+          "a massive shock to every future bar.\n")
 
 
 # --------------------------------------------------------- old vs new diff
 
-# NOTE: an earlier version of this filter reused scan_current_buys.py's
-# straddle_n < 75 "thin_sample" WARNING as a hard EXCLUSION threshold.
-# That was the wrong tool for this job: that threshold was only ever meant
-# to flag an otherwise-live signal for extra caution, not to decide whether
-# a trade's entry era is trustworthy enough to include in a comparison.
-# The straddle count itself can legitimately stay low for a smoothly
-# trending ticker across its ENTIRE multi-decade history (the module's own
-# docstring example: XEL accumulates only ~51 straddle-months total since
-# 1973) -- applying 75 as a point-in-time per-trade cutoff wiped out nearly
-# every trade for every ticker except WMT, which isn't a useful comparison,
-# just an overcorrection. Replaced with a plain calendar warm-up instead:
-# require a minimum number of MONTHS OF PRICE HISTORY since the ticker's
-# first available bar, independent of the straddle-specific statistic.
-MIN_HISTORY_MONTHS = 60  # 5 years -- a standard backtesting warm-up buffer,
-                         # chosen to exclude MSFT's 44-month 1989 entry
-                         # without being so strict it guts everything else
+MIN_HISTORY_MONTHS = 60  # 5 years -- a standard backtesting warm-up buffer.
+                         # NOTE: this is NOT the live system's separate
+                         # thin_sample (straddle_n<75) warning -- an earlier
+                         # version of this script mistakenly reused that as
+                         # an exclusion filter and it wiped out nearly every
+                         # trade for every ticker (a smoothly trending stock
+                         # can legitimately never clear 75 straddle-months
+                         # across its ENTIRE history -- see XEL in the
+                         # original docstring). This is a plain count of
+                         # calendar months since first available data,
+                         # unrelated to the straddle-specific statistic.
 
 
 def months_of_history_asof(m: pd.DataFrame, as_of) -> int:
-    """Calendar months between a monthly OHLC series' first row and a
-    given date -- NOT the straddle-specific count, just plain elapsed
-    history. This is what actually explains MSFT's outlier trade (44
-    months since IPO is simply too little history for the sticky trend
-    state to be trustworthy yet, regardless of how the straddle median
-    happens to be behaving)."""
     if m.empty or as_of < m.index[0]:
         return 0
     return len(m[m.index <= as_of])
 
 
-def compare_old_vs_new(tickers):
-    rows = []
-    for tk in tickers:
+def compare_old_vs_new(tickers, include_etfs=True):
+    """Runs BOTH pipelines on every ticker, reports UNFILTERED results as
+    the primary comparison (per instruction: do not silently alter the
+    original benchmark), and the 60-month-warm-up-filtered results
+    separately alongside it -- never only the filtered view."""
+    summary_rows = []
+    trade_diff_rows = []
+    all_tickers = [(tk, "stock") for tk in tickers]
+    if include_etfs:
+        all_tickers += [(tk, "etf") for tk in ETF_BASKET]
+
+    for i, (tk, uni) in enumerate(all_tickers):
         try:
             weekly = bt.fetch(tk)
             daily = bt.fetch_daily(tk)
@@ -208,96 +282,97 @@ def compare_old_vs_new(tickers):
             continue
 
         old = bt.prep(weekly)
-        new, _monthly_indicator_new = prep_v2(weekly, daily)
-        # OHLC monthly series for thin-sample counting -- NOT the indicator
-        # output (basis/upperR/lowerR/green) that prep_v2 returns, which has
-        # no Open/High/Low/Close columns. Built the same way each pipeline
-        # builds it internally: OLD from weekly-resample, NEW from daily-
-        # resample, so the comparison stays like-for-like.
+        new, _ = prep_v2(weekly, daily)
         monthly_old = weekly.resample("ME").agg({"Open": "first", "High": "max",
                                                   "Low": "min", "Close": "last"}).dropna()
         monthly_new = daily.resample("ME").agg({"Open": "first", "High": "max",
                                                  "Low": "min", "Close": "last"}).dropna()
 
-        # align on common weekly index
         common = old.index.intersection(new.index)
         old_c, new_c = old.loc[common], new.loc[common]
-
         green_diff = (old_c["green"] != new_c["green"]).sum()
         basis_pct_diff = ((new_c["basis"] - old_c["basis"]).abs() / old_c["basis"]).mean()
         band_pct_diff = ((new_c["upperR"] - old_c["upperR"]).abs() / old_c["upperR"]).mean()
 
-        # re-run the actual trade logic on each prepped dataframe, config frozen
         trades_old = bt.run(old, "High", "NBarHigh")
         trades_new = bt.run(new, "High", "NBarHigh")
 
-        # warm-up filter: drop any trade whose ENTRY happened before its
-        # own pipeline had accumulated MIN_HISTORY_MONTHS of calendar
-        # history -- see the note above on why this replaced the
-        # straddle-count-based filter.
+        # record EVERY trade (both pipelines) for the trade-level diff file
+        for t in trades_old:
+            trade_diff_rows.append({"ticker": tk, "universe": uni, "pipeline": "old",
+                                     "entry_date": t["entry_date"], "exit_date": t["exit_date"],
+                                     "ret": t["ret"], "hold": t["hold"], "reason": t["reason"]})
+        for t in trades_new:
+            trade_diff_rows.append({"ticker": tk, "universe": uni, "pipeline": "new",
+                                     "entry_date": t["entry_date"], "exit_date": t["exit_date"],
+                                     "ret": t["ret"], "hold": t["hold"], "reason": t["reason"]})
+
+        # UNFILTERED stats -- the primary comparison, per instruction
+        st_old_raw, st_new_raw = bt.stats(trades_old), bt.stats(trades_new)
+
+        # 60-month-warm-up-filtered stats -- reported ALONGSIDE, not instead
         trades_old_f = [t for t in trades_old
                          if months_of_history_asof(monthly_old, t["entry_date"]) >= MIN_HISTORY_MONTHS]
         trades_new_f = [t for t in trades_new
                          if months_of_history_asof(monthly_new, t["entry_date"]) >= MIN_HISTORY_MONTHS]
-        n_dropped_old = len(trades_old) - len(trades_old_f)
-        n_dropped_new = len(trades_new) - len(trades_new_f)
+        st_old_f, st_new_f = bt.stats(trades_old_f), bt.stats(trades_new_f)
 
-        st_old, st_new = bt.stats(trades_old_f), bt.stats(trades_new_f)
-
-        rows.append({
-            "ticker": tk, "weekly_bars_compared": len(common),
-            "green_state_flips_differ_on_pct": 100 * green_diff / len(common),
+        summary_rows.append({
+            "ticker": tk, "universe": uni, "weekly_bars_compared": len(common),
+            "green_state_flips_differ_on_pct": 100 * green_diff / len(common) if len(common) else np.nan,
             "mean_basis_pct_diff": 100 * basis_pct_diff,
             "mean_upperband_pct_diff": 100 * band_pct_diff,
-            "old_trades_thin_dropped": n_dropped_old, "new_trades_thin_dropped": n_dropped_new,
-            "old_trades": st_old["trades"], "new_trades": st_new["trades"],
-            "old_win_rate": st_old["win_rate"], "new_win_rate": st_new["win_rate"],
-            "old_expectancy": st_old["expectancy"], "new_expectancy": st_new["expectancy"],
-            "old_pf": st_old["pf"], "new_pf": st_new["pf"],
+            "old_trades_unfiltered": st_old_raw["trades"], "new_trades_unfiltered": st_new_raw["trades"],
+            "old_win_rate_unfiltered": st_old_raw["win_rate"], "new_win_rate_unfiltered": st_new_raw["win_rate"],
+            "old_expectancy_unfiltered": st_old_raw["expectancy"], "new_expectancy_unfiltered": st_new_raw["expectancy"],
+            "old_pf_unfiltered": st_old_raw["pf"], "new_pf_unfiltered": st_new_raw["pf"],
+            "old_trades_60mo_filtered": st_old_f["trades"], "new_trades_60mo_filtered": st_new_f["trades"],
+            "old_win_rate_60mo_filtered": st_old_f["win_rate"], "new_win_rate_60mo_filtered": st_new_f["win_rate"],
+            "old_expectancy_60mo_filtered": st_old_f["expectancy"], "new_expectancy_60mo_filtered": st_new_f["expectancy"],
+            "old_pf_60mo_filtered": st_old_f["pf"], "new_pf_60mo_filtered": st_new_f["pf"],
         })
-        print(f"{tk}: done "
+        print(f"[{i+1}/{len(all_tickers)}] {tk} ({uni}): done "
               f"(green differs on {100*green_diff/len(common):.1f}% of weeks, "
-              f"{n_dropped_old} old / {n_dropped_new} new trades dropped as warm-up, "
-              f"old {st_old['trades']} trades / new {st_new['trades']} trades after filter)",
+              f"unfiltered {st_old_raw['trades']}->{st_new_raw['trades']} trades, "
+              f"60mo-filtered {st_old_f['trades']}->{st_new_f['trades']} trades)",
               file=sys.stderr)
 
-    out = pd.DataFrame(rows)
-    out.to_csv("milestone_a_old_vs_new.csv", index=False)
-    pd.set_option("display.width", 160)
-    print(f"\n=== OLD (benchmark) vs NEW (daily-sourced, no-extra-shift) "
-          f"-- trades entering before {MIN_HISTORY_MONTHS} months of calendar history EXCLUDED from both ===")
-    print(out.to_string(index=False))
-    print("\nSaved: milestone_a_old_vs_new.csv -- send this back for review.")
-    print("\nHow to read it: 'green_state_flips_differ_on_pct' is the most consequential column --")
-    print("every week where old/new disagree on green/red is a week where the two engines would")
-    print("make a DIFFERENT entry/exit decision. A small number (a few %) is expected given the")
-    print("fixes target a 1-month timing shift, not a wholesale rewrite. A large number would mean")
-    print("something deeper is wrong with one of the two pipelines and needs investigation before")
-    print("trusting either one's trade-level results.")
-    print(f"\n'*_trades_thin_dropped' shows how many trades were excluded for entering before "
-          f"{MIN_HISTORY_MONTHS} months (a standard warm-up buffer, NOT the live system's separate")
-    print("thin_sample WARNING, which an earlier version of this script mistakenly reused as an")
-    print("exclusion cutoff and which wiped out almost every trade for every ticker except WMT --")
-    print("that threshold can legitimately never clear 75 across a ticker's entire history for a")
-    print("smoothly trending stock, so it isn't a usable per-trade filter. This warm-up buffer is")
-    print("what removed MSFT's one 1989-entry, 11-year, +4584% outlier trade from the comparison.")
+    summary = pd.DataFrame(summary_rows)
+    summary.to_csv("milestone_a_summary_full_universe.csv", index=False)
+    diffs = pd.DataFrame(trade_diff_rows)
+    diffs.to_csv("milestone_a_trade_level_detail.csv", index=False)
+
+    pd.set_option("display.width", 200)
+    pd.set_option("display.max_rows", 500)
+    print(f"\n=== Milestone A, FULL UNIVERSE ({len(summary)} tickers) ===")
+    print("Primary comparison is UNFILTERED (the original benchmark, untouched). "
+          "60-month-warm-up-filtered columns are reported ALONGSIDE for context, never in place of it.\n")
+    print(summary.to_string(index=False))
+    print(f"\nSaved: milestone_a_summary_full_universe.csv (per-ticker summary, both filtered "
+          f"and unfiltered)")
+    print(f"Saved: milestone_a_trade_level_detail.csv (every individual trade, both pipelines, "
+          f"{len(diffs)} rows) -- for entry/exit/return-level diffing")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tickers", type=str, default=None)
+    ap.add_argument("--tickers", type=str, default=None,
+                     help="comma-separated tickers; default is the FULL bt.UNIVERSE + ETF basket")
+    ap.add_argument("--no-etfs", action="store_true")
     ap.add_argument("--synthetic", action="store_true",
-                     help="run only the no-lookahead unit test, no network needed")
+                     help="run only the point-in-time and future-mutation tests, no network needed")
     args = ap.parse_args()
 
-    print("Running no-lookahead / no-extra-staleness unit test (synthetic data)...\n")
-    test_no_lookahead()
+    print("Running point-in-time recompute test (synthetic data)...\n")
+    test_point_in_time_recompute()
+    print("Running future-mutation test (synthetic data)...\n")
+    test_future_mutation()
 
     if args.synthetic:
         return
 
-    tickers = args.tickers.split(",") if args.tickers else TEST_TICKERS_DEFAULT
-    compare_old_vs_new(tickers)
+    tickers = args.tickers.split(",") if args.tickers else list(bt.UNIVERSE)
+    compare_old_vs_new(tickers, include_etfs=not args.no_etfs)
 
 
 if __name__ == "__main__":
