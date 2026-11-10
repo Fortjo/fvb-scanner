@@ -6,10 +6,18 @@ ON  = SPY's last COMPLETED month closed above its own 10-month average.
 OFF = it didn't.
 
 Backtested directly against this project's own FVB signals, not just a
-generic market test: gating NEW entries with this flag cut the worst
-drawdown roughly in half (-22.6% -> -11.7%) for about a 0.5-point cost
-in CAGR, on the real 33FVB trade history across the full universe
-(see test_fvb_market_filter.py for that test).
+generic market test: historically, gating NEW entries with this flag
+coincided with roughly half the worst drawdown (-24.9% -> -13.7%) for
+about a 0.35-point cost in CAGR. An independent audit (Nov 2026) found
+real bugs in the original backtest engine (fixed) and flagged that the
+first placebo test overstated significance by treating each trade's
+regime label as an independent coin flip, when "is the market trending
+up" is actually autocorrelated for months at a stretch. Rerun with a
+calendar-aware placebo (shuffling real month-long ON/OFF blocks instead
+of individual trade labels), the drawdown improvement lands around
+p=0.10-0.13 -- suggestive, not statistically proven at the usual 0.05
+bar. Treat this as a reasonable, evidence-backed heuristic, not a
+validated edge.
 
 This module only answers "is the market currently in an uptrend." It
 does not touch any existing open position's own sell/stop logic, and
@@ -63,11 +71,13 @@ def regime_banner_text(info: dict) -> str:
     line = (f"Market regime: {info['regime']}  (S&P closed {info['as_of']} {arrow} its "
             f"{SMA_MONTHS}-month average: {info['spy_close']:.1f} vs {info['spy_sma']:.1f})")
     if info["regime"] == "OFF":
-        line += ("\nPer the market-timing filter (tested against this system's own trade "
-                  "history: cuts max drawdown roughly in half for a small cost in return), "
-                  "consider holding off on acting on NEW buy signals below until this turns "
-                  "back ON. Existing open positions are unaffected — keep following their "
-                  "normal sell/stop signals as usual.")
+        line += ("\nHistorically this coincided with roughly half the max drawdown for a "
+                  "small cost in return — a reasonable heuristic, but an independent audit "
+                  "found the improvement isn't statistically proven (p~0.10-0.13 under a "
+                  "calendar-aware placebo). Consider holding off on NEW buy signals below "
+                  "until this turns back ON, using your own judgment. Existing open "
+                  "positions are unaffected — keep following their normal sell/stop signals "
+                  "as usual.")
     return line
 
 
@@ -82,12 +92,13 @@ def regime_banner_html(info: dict) -> str:
             f'(S&amp;P closed {info["as_of"]} {arrow} its {SMA_MONTHS}-month average: '
             f'{info["spy_close"]:.1f} vs {info["spy_sma"]:.1f})</p>')
     if info["regime"] == "OFF":
-        html += ('<p style="color:#c0392b;margin:4px 0 16px 0;">Per the market-timing filter '
-                 "(tested against this system's own trade history: cuts max drawdown roughly "
-                 "in half for a small cost in return), consider holding off on acting on "
-                 "<b>NEW</b> buy signals below until this turns back ON. Existing open "
-                 "positions are unaffected — keep following their normal sell/stop signals "
-                 "as usual.</p>")
+        html += ('<p style="color:#c0392b;margin:4px 0 16px 0;">Historically this coincided '
+                 "with roughly half the max drawdown for a small cost in return &mdash; a "
+                 "reasonable heuristic, but not statistically proven (p&#8201;~&#8201;0.10-0.13 "
+                 "under an independent audit's calendar-aware placebo). Consider holding off "
+                 "on acting on <b>NEW</b> buy signals below until this turns back ON, using "
+                 "your own judgment. Existing open positions are unaffected &mdash; keep "
+                 "following their normal sell/stop signals as usual.</p>")
     return html
 
 
