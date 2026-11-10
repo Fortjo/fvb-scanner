@@ -238,8 +238,8 @@ def main():
 
     placebo_dd = np.array(placebo_dd)
     placebo_cagr = np.array(placebo_cagr)
-    dd_improve_B = mA["dd"] - mB["dd"]           # positive = B improved (less negative dd)
-    dd_improve_C = mA["dd"] - placebo_dd         # same, per random run
+    dd_improve_B = mB["dd"] - mA["dd"]           # positive = B improved (less negative dd than A)
+    dd_improve_C = placebo_dd - mA["dd"]         # same, per random run
     pct_random_beats_B = 100 * np.mean(dd_improve_C >= dd_improve_B)
 
     print(f"\n  C) EXPOSURE-MATCHED PLACEBO: random skip of the same {100*skip_rate:.0f}% of "
