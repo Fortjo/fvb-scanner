@@ -194,12 +194,16 @@ def compare_old_vs_new(tickers):
             continue
 
         old = bt.prep(weekly)
-        new, monthly_new = prep_v2(weekly, daily)
-        # reconstruct the OLD monthly series the same way bt.prep() builds
-        # it internally, so thin-sample counting can be done on a like-for-
-        # like basis for both pipelines.
+        new, _monthly_indicator_new = prep_v2(weekly, daily)
+        # OHLC monthly series for thin-sample counting -- NOT the indicator
+        # output (basis/upperR/lowerR/green) that prep_v2 returns, which has
+        # no Open/High/Low/Close columns. Built the same way each pipeline
+        # builds it internally: OLD from weekly-resample, NEW from daily-
+        # resample, so the comparison stays like-for-like.
         monthly_old = weekly.resample("ME").agg({"Open": "first", "High": "max",
                                                   "Low": "min", "Close": "last"}).dropna()
+        monthly_new = daily.resample("ME").agg({"Open": "first", "High": "max",
+                                                 "Low": "min", "Close": "last"}).dropna()
 
         # align on common weekly index
         common = old.index.intersection(new.index)
