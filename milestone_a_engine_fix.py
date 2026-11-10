@@ -163,6 +163,23 @@ def test_no_lookahead():
 
 
 # --------------------------------------------------------- old vs new diff
+
+THIN_SAMPLE_THRESHOLD = 75  # same threshold already live in scan_current_buys.py's
+                            # "thin_sample" warning -- not invented for this script
+
+
+def straddle_count_asof(m: pd.DataFrame, length: int, as_of) -> int:
+    """Point-in-time version of bt.straddle_sample_size(): how many
+    historical straddle months had accumulated by the time a given trade
+    entered, not the series' final total. A trade entering while this is
+    below THIN_SAMPLE_THRESHOLD is exactly the kind of early-history,
+    fragile-median situation the live system already flags (MSFT's
+    1989 entry, 44 months into its listing, is a clean example -- see
+    the Nov 2026 diagnostic run)."""
+    m_trunc = m[m.index <= as_of]
+    return bt.straddle_sample_size(m_trunc, length)
+
+
 def compare_old_vs_new(tickers):
     rows = []
     for tk in tickers:
@@ -177,7 +194,12 @@ def compare_old_vs_new(tickers):
             continue
 
         old = bt.prep(weekly)
-        new, _ = prep_v2(weekly, daily)
+        new, monthly_new = prep_v2(weekly, daily)
+        # reconstruct the OLD monthly series the same way bt.prep() builds
+        # it internally, so thin-sample counting can be done on a like-for-
+        # like basis for both pipelines.
+        monthly_old = weekly.resample("ME").agg({"Open": "first", "High": "max",
+                                                  "Low": "min", "Close": "last"}).dropna()
 
         # align on common weekly index
         common = old.index.intersection(new.index)
@@ -190,13 +212,25 @@ def compare_old_vs_new(tickers):
         # re-run the actual trade logic on each prepped dataframe, config frozen
         trades_old = bt.run(old, "High", "NBarHigh")
         trades_new = bt.run(new, "High", "NBarHigh")
-        st_old, st_new = bt.stats(trades_old), bt.stats(trades_new)
+
+        # thin-sample filter: drop any trade whose ENTRY happened while its
+        # own pipeline's straddle-month count was still below the live
+        # system's existing 75-month threshold.
+        trades_old_f = [t for t in trades_old
+                         if straddle_count_asof(monthly_old, bt.FVB_LEN, t["entry_date"]) >= THIN_SAMPLE_THRESHOLD]
+        trades_new_f = [t for t in trades_new
+                         if straddle_count_asof(monthly_new, bt.FVB_LEN, t["entry_date"]) >= THIN_SAMPLE_THRESHOLD]
+        n_dropped_old = len(trades_old) - len(trades_old_f)
+        n_dropped_new = len(trades_new) - len(trades_new_f)
+
+        st_old, st_new = bt.stats(trades_old_f), bt.stats(trades_new_f)
 
         rows.append({
             "ticker": tk, "weekly_bars_compared": len(common),
             "green_state_flips_differ_on_pct": 100 * green_diff / len(common),
             "mean_basis_pct_diff": 100 * basis_pct_diff,
             "mean_upperband_pct_diff": 100 * band_pct_diff,
+            "old_trades_thin_dropped": n_dropped_old, "new_trades_thin_dropped": n_dropped_new,
             "old_trades": st_old["trades"], "new_trades": st_new["trades"],
             "old_win_rate": st_old["win_rate"], "new_win_rate": st_new["win_rate"],
             "old_expectancy": st_old["expectancy"], "new_expectancy": st_new["expectancy"],
@@ -204,13 +238,15 @@ def compare_old_vs_new(tickers):
         })
         print(f"{tk}: done "
               f"(green differs on {100*green_diff/len(common):.1f}% of weeks, "
-              f"old {st_old['trades']} trades / new {st_new['trades']} trades)",
+              f"{n_dropped_old} old / {n_dropped_new} new trades dropped as thin-sample, "
+              f"old {st_old['trades']} trades / new {st_new['trades']} trades after filter)",
               file=sys.stderr)
 
     out = pd.DataFrame(rows)
     out.to_csv("milestone_a_old_vs_new.csv", index=False)
     pd.set_option("display.width", 160)
-    print("\n=== OLD (benchmark, unchanged backtest_33fvb.py) vs NEW (daily-sourced, no-extra-shift) ===")
+    print(f"\n=== OLD (benchmark) vs NEW (daily-sourced, no-extra-shift) "
+          f"-- thin-sample trades (<{THIN_SAMPLE_THRESHOLD} straddle months at entry) EXCLUDED from both ===")
     print(out.to_string(index=False))
     print("\nSaved: milestone_a_old_vs_new.csv -- send this back for review.")
     print("\nHow to read it: 'green_state_flips_differ_on_pct' is the most consequential column --")
@@ -219,6 +255,10 @@ def compare_old_vs_new(tickers):
     print("fixes target a 1-month timing shift, not a wholesale rewrite. A large number would mean")
     print("something deeper is wrong with one of the two pipelines and needs investigation before")
     print("trusting either one's trade-level results.")
+    print(f"\n'*_trades_thin_dropped' shows how many trades were excluded for entering during each")
+    print(f"pipeline's own thin-sample period (<{THIN_SAMPLE_THRESHOLD} straddle months of history), the same")
+    print("threshold already live in scan_current_buys.py's 'thin_sample' warning -- not new. This is")
+    print("what removed MSFT's one 1989-entry, 11-year, +4584% outlier trade from the comparison.")
 
 
 def main():
