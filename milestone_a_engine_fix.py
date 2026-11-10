@@ -164,20 +164,34 @@ def test_no_lookahead():
 
 # --------------------------------------------------------- old vs new diff
 
-THIN_SAMPLE_THRESHOLD = 75  # same threshold already live in scan_current_buys.py's
-                            # "thin_sample" warning -- not invented for this script
+# NOTE: an earlier version of this filter reused scan_current_buys.py's
+# straddle_n < 75 "thin_sample" WARNING as a hard EXCLUSION threshold.
+# That was the wrong tool for this job: that threshold was only ever meant
+# to flag an otherwise-live signal for extra caution, not to decide whether
+# a trade's entry era is trustworthy enough to include in a comparison.
+# The straddle count itself can legitimately stay low for a smoothly
+# trending ticker across its ENTIRE multi-decade history (the module's own
+# docstring example: XEL accumulates only ~51 straddle-months total since
+# 1973) -- applying 75 as a point-in-time per-trade cutoff wiped out nearly
+# every trade for every ticker except WMT, which isn't a useful comparison,
+# just an overcorrection. Replaced with a plain calendar warm-up instead:
+# require a minimum number of MONTHS OF PRICE HISTORY since the ticker's
+# first available bar, independent of the straddle-specific statistic.
+MIN_HISTORY_MONTHS = 60  # 5 years -- a standard backtesting warm-up buffer,
+                         # chosen to exclude MSFT's 44-month 1989 entry
+                         # without being so strict it guts everything else
 
 
-def straddle_count_asof(m: pd.DataFrame, length: int, as_of) -> int:
-    """Point-in-time version of bt.straddle_sample_size(): how many
-    historical straddle months had accumulated by the time a given trade
-    entered, not the series' final total. A trade entering while this is
-    below THIN_SAMPLE_THRESHOLD is exactly the kind of early-history,
-    fragile-median situation the live system already flags (MSFT's
-    1989 entry, 44 months into its listing, is a clean example -- see
-    the Nov 2026 diagnostic run)."""
-    m_trunc = m[m.index <= as_of]
-    return bt.straddle_sample_size(m_trunc, length)
+def months_of_history_asof(m: pd.DataFrame, as_of) -> int:
+    """Calendar months between a monthly OHLC series' first row and a
+    given date -- NOT the straddle-specific count, just plain elapsed
+    history. This is what actually explains MSFT's outlier trade (44
+    months since IPO is simply too little history for the sticky trend
+    state to be trustworthy yet, regardless of how the straddle median
+    happens to be behaving)."""
+    if m.empty or as_of < m.index[0]:
+        return 0
+    return len(m[m.index <= as_of])
 
 
 def compare_old_vs_new(tickers):
@@ -217,13 +231,14 @@ def compare_old_vs_new(tickers):
         trades_old = bt.run(old, "High", "NBarHigh")
         trades_new = bt.run(new, "High", "NBarHigh")
 
-        # thin-sample filter: drop any trade whose ENTRY happened while its
-        # own pipeline's straddle-month count was still below the live
-        # system's existing 75-month threshold.
+        # warm-up filter: drop any trade whose ENTRY happened before its
+        # own pipeline had accumulated MIN_HISTORY_MONTHS of calendar
+        # history -- see the note above on why this replaced the
+        # straddle-count-based filter.
         trades_old_f = [t for t in trades_old
-                         if straddle_count_asof(monthly_old, bt.FVB_LEN, t["entry_date"]) >= THIN_SAMPLE_THRESHOLD]
+                         if months_of_history_asof(monthly_old, t["entry_date"]) >= MIN_HISTORY_MONTHS]
         trades_new_f = [t for t in trades_new
-                         if straddle_count_asof(monthly_new, bt.FVB_LEN, t["entry_date"]) >= THIN_SAMPLE_THRESHOLD]
+                         if months_of_history_asof(monthly_new, t["entry_date"]) >= MIN_HISTORY_MONTHS]
         n_dropped_old = len(trades_old) - len(trades_old_f)
         n_dropped_new = len(trades_new) - len(trades_new_f)
 
@@ -242,7 +257,7 @@ def compare_old_vs_new(tickers):
         })
         print(f"{tk}: done "
               f"(green differs on {100*green_diff/len(common):.1f}% of weeks, "
-              f"{n_dropped_old} old / {n_dropped_new} new trades dropped as thin-sample, "
+              f"{n_dropped_old} old / {n_dropped_new} new trades dropped as warm-up, "
               f"old {st_old['trades']} trades / new {st_new['trades']} trades after filter)",
               file=sys.stderr)
 
@@ -250,7 +265,7 @@ def compare_old_vs_new(tickers):
     out.to_csv("milestone_a_old_vs_new.csv", index=False)
     pd.set_option("display.width", 160)
     print(f"\n=== OLD (benchmark) vs NEW (daily-sourced, no-extra-shift) "
-          f"-- thin-sample trades (<{THIN_SAMPLE_THRESHOLD} straddle months at entry) EXCLUDED from both ===")
+          f"-- trades entering before {MIN_HISTORY_MONTHS} months of calendar history EXCLUDED from both ===")
     print(out.to_string(index=False))
     print("\nSaved: milestone_a_old_vs_new.csv -- send this back for review.")
     print("\nHow to read it: 'green_state_flips_differ_on_pct' is the most consequential column --")
@@ -259,9 +274,12 @@ def compare_old_vs_new(tickers):
     print("fixes target a 1-month timing shift, not a wholesale rewrite. A large number would mean")
     print("something deeper is wrong with one of the two pipelines and needs investigation before")
     print("trusting either one's trade-level results.")
-    print(f"\n'*_trades_thin_dropped' shows how many trades were excluded for entering during each")
-    print(f"pipeline's own thin-sample period (<{THIN_SAMPLE_THRESHOLD} straddle months of history), the same")
-    print("threshold already live in scan_current_buys.py's 'thin_sample' warning -- not new. This is")
+    print(f"\n'*_trades_thin_dropped' shows how many trades were excluded for entering before "
+          f"{MIN_HISTORY_MONTHS} months (a standard warm-up buffer, NOT the live system's separate")
+    print("thin_sample WARNING, which an earlier version of this script mistakenly reused as an")
+    print("exclusion cutoff and which wiped out almost every trade for every ticker except WMT --")
+    print("that threshold can legitimately never clear 75 across a ticker's entire history for a")
+    print("smoothly trending stock, so it isn't a usable per-trade filter. This warm-up buffer is")
     print("what removed MSFT's one 1989-entry, 11-year, +4584% outlier trade from the comparison.")
 
 
