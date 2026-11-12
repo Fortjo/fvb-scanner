@@ -903,7 +903,11 @@ def test_vol_sizing_wiring_end_to_end():
 # REAL-DATA PIPELINE -- runs BOTH strategies through the same corrected
 # engine on the same data, exports CSVs for each, prints a comparison.
 # --------------------------------------------------------------------------
-def run_comparison(tickers: list):
+def run_comparison(tickers: list, output_tag: str = ""):
+    """output_tag: appended to every output filename's "milestone_c"
+    prefix (e.g. "_sp500" -> milestone_c_sp500_baseline_trades.csv), so a
+    full-S&P-500 run never overwrites the default 170-name-universe
+    run's CSVs -- both can be kept side by side."""
     tickers_prepped = {}
     skipped_tickers = []
     for i, tk in enumerate(tickers):
@@ -947,8 +951,8 @@ def run_comparison(tickers: list):
     cand_metrics = compute_metrics(cand_daily, cand_trades, cand_open, START_CAPITAL)
 
     for label, prefix, daily_df, trades_df, skipped_df, open_df, failures_df, recon in [
-        ("baseline", "milestone_c_baseline", base_daily, base_trades, base_skipped, base_open, base_failures, base_recon),
-        ("vol_sizing", "milestone_c_vol_sizing", cand_daily, cand_trades, cand_skipped, cand_open, cand_failures, cand_recon),
+        ("baseline", f"milestone_c{output_tag}_baseline", base_daily, base_trades, base_skipped, base_open, base_failures, base_recon),
+        ("vol_sizing", f"milestone_c{output_tag}_vol_sizing", cand_daily, cand_trades, cand_skipped, cand_open, cand_failures, cand_recon),
     ]:
         trades_df.to_csv(f"{prefix}_trades.csv", index=False)
         daily_df.to_csv(f"{prefix}_daily_equity.csv")
@@ -967,16 +971,17 @@ def run_comparison(tickers: list):
     comparison_rows = [{"metric": k, "baseline": base_metrics.get(k), "vol_sizing_candidate": cand_metrics.get(k)}
                         for k in all_keys]
     comparison_df = pd.DataFrame(comparison_rows)
-    comparison_df.to_csv("milestone_c_comparison.csv", index=False)
+    comparison_path = f"milestone_c{output_tag}_comparison.csv"
+    comparison_df.to_csv(comparison_path, index=False)
 
     pd.set_option("display.width", 160)
-    print("\n=== MILESTONE C: BASELINE (corrected engine) vs VOLATILITY-ADJUSTED SIZING CANDIDATE ===")
+    print(f"\n=== MILESTONE C{output_tag.upper()}: BASELINE (corrected engine) vs VOLATILITY-ADJUSTED SIZING CANDIDATE ===")
     print(comparison_df.to_string(index=False))
     print("\n=== RECONCILIATION -- baseline ===")
     print(pd.Series(base_recon).to_string())
     print("\n=== RECONCILIATION -- vol-sizing candidate ===")
     print(pd.Series(cand_recon).to_string())
-    print("\nSaved: milestone_c_comparison.csv")
+    print(f"\nSaved: {comparison_path}")
     return base_metrics, cand_metrics, base_recon, cand_recon
 
 
@@ -987,6 +992,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tickers", type=str, default=None)
     ap.add_argument("--synthetic", action="store_true")
+    ap.add_argument("--sp500", action="store_true",
+                     help="Use the full S&P 500 (bt.SP500_TICKERS, ~503 names) instead of the "
+                          "default S&P 100 + NASDAQ 100 combined universe (bt.UNIVERSE, 170 names). "
+                          "NOTE: the 170-name default was chosen deliberately to match the universe "
+                          "Peter himself says he tested the strategy on -- see the comment above "
+                          "UNIVERSE in backtest_33fvb.py. A full-S&P-500 run answers a different "
+                          "question (does this generalize beyond Peter's own universe?), not a "
+                          "like-for-like rerun of the existing comparison. Output files get a "
+                          "'_sp500' tag so they never overwrite the default-universe run's CSVs.")
     args = ap.parse_args()
 
     print("Running vol-sizing-multiplier-formula test...\n")
@@ -1005,8 +1019,21 @@ def main():
     if args.synthetic:
         return
 
-    tickers = args.tickers.split(",") if args.tickers else list(bt.UNIVERSE)
-    run_comparison(tickers)
+    if args.tickers:
+        tickers = args.tickers.split(",")
+        output_tag = ""
+    elif args.sp500:
+        tickers = list(bt.SP500_TICKERS)
+        output_tag = "_sp500"
+        print(f"\nUsing the full S&P 500 universe ({len(tickers)} tickers) -- "
+              f"this is a DIFFERENT question from the default comparison (does the strategy "
+              f"generalize beyond Peter's own validated S&P100+NASDAQ100 universe?), not a "
+              f"rerun of it. Outputs will be tagged 'milestone_c_sp500_*'.\n", file=sys.stderr)
+    else:
+        tickers = list(bt.UNIVERSE)
+        output_tag = ""
+
+    run_comparison(tickers, output_tag=output_tag)
 
 
 if __name__ == "__main__":
