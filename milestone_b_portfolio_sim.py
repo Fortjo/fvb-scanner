@@ -739,13 +739,22 @@ def run_real_universe(tickers: list):
         spy_window = spy_eq.loc[(spy_eq.index >= common_start) & (spy_eq.index <= common_end)]
         trades_window = trades_df[(trades_df["exit_date"] >= common_start) &
                                    (trades_df["exit_date"] <= common_end)] if len(trades_df) else trades_df
+        # daily_window["equity"].iloc[0] is the ACTUAL dollar level the
+        # strategy had already compounded to by common_start, NOT
+        # START_CAPITAL -- it had been running since whichever ticker's
+        # history starts earliest. CAGR/Sharpe/Sortino/drawdown/vol are
+        # scale-invariant so this doesn't affect them, but a raw dollar
+        # comparison needs the same starting capital (item 8), so a
+        # purely illustrative rescale is reported separately too.
         metrics_window = compute_metrics(daily_window, trades_window, daily_window["equity"].iloc[0])
         spy_metrics = compute_metrics(spy_window.assign(open_positions=1), pd.DataFrame(), START_CAPITAL)
+        rescale = START_CAPITAL / daily_window["equity"].iloc[0]
+        final_equity_rescaled_100k = daily_window["equity"].iloc[-1] * rescale
         print(f"\nSPY-comparable window (both sides, identical dates): "
               f"{common_start.date()} to {common_end.date()}", file=sys.stderr)
     else:
         print("SPY fetch failed -- no benchmark comparison possible", file=sys.stderr)
-        metrics_window, spy_metrics = {}, {}
+        metrics_window, spy_metrics, final_equity_rescaled_100k = {}, {}, np.nan
 
     trades_df.to_csv("milestone_b_trades.csv", index=False)
     daily_out.to_csv("milestone_b_daily_equity.csv")
@@ -757,6 +766,10 @@ def run_real_universe(tickers: list):
                       "strategy_vs_spy_window": metrics_window.get(k, np.nan),
                       "spy_buy_and_hold_same_window": spy_metrics.get(k, np.nan)}
                      for k in all_keys]
+    summary_rows.append({"metric": "final_equity_rescaled_to_100k_start (illustrative only)",
+                          "strategy_full_history": np.nan,
+                          "strategy_vs_spy_window": final_equity_rescaled_100k,
+                          "spy_buy_and_hold_same_window": spy_metrics.get("final_equity", np.nan)})
     summary_df = pd.DataFrame(summary_rows)
     summary_df.to_csv("milestone_b_summary.csv", index=False)
 

@@ -35,13 +35,34 @@ spy_window = pd.DataFrame({"equity": spy.loc[(spy.index >= common_start) & (spy.
 trades_window = trades[(trades["exit_date"] >= common_start) & (trades["exit_date"] <= common_end)]
 
 metrics_full = mb.compute_metrics(daily, trades, mb.START_CAPITAL)
+# NOTE: daily_window["equity"].iloc[0] is the ACTUAL dollar level the
+# strategy had already compounded to by common_start (it had been
+# running since 1970) -- NOT $100k. CAGR/Sharpe/Sortino/drawdown/
+# volatility are scale-invariant so this basis doesn't affect them, but
+# raw dollar figures (final_equity) computed on it are NOT on the same
+# starting-capital basis as SPY's. Reported separately below.
 metrics_window = mb.compute_metrics(daily_window, trades_window, daily_window["equity"].iloc[0])
 spy_metrics = mb.compute_metrics(spy_window.assign(open_positions=1), pd.DataFrame(), mb.START_CAPITAL)
+
+# Illustrative-only: what the SAME equity curve (same trades, same
+# period) would be worth if it had been rescaled to start at exactly
+# $100,000 on common_start, for a dollar-for-dollar reading next to
+# SPY's figure. This is a pure linear rescale of the realized equity
+# path, NOT a re-simulation with smaller capital -- real position
+# sizing/skips (max_positions, insufficient_cash) would likely differ
+# slightly with a genuinely smaller capital base from the start, so
+# treat this as illustrative, not as a rerun of the strategy.
+rescale = mb.START_CAPITAL / daily_window["equity"].iloc[0]
+final_equity_rescaled_100k = daily_window["equity"].iloc[-1] * rescale
 
 rows = [{"metric": k, "strategy_full_history": metrics_full.get(k),
          "strategy_vs_spy_window": metrics_window.get(k),
          "spy_buy_and_hold_same_window": spy_metrics.get(k)}
         for k in metrics_full.keys()]
+rows.append({"metric": "final_equity_rescaled_to_100k_start (illustrative only)",
+             "strategy_full_history": None,
+             "strategy_vs_spy_window": final_equity_rescaled_100k,
+             "spy_buy_and_hold_same_window": spy_metrics.get("final_equity")})
 out = pd.DataFrame(rows)
 out.to_csv("milestone_b_summary_corrected.csv", index=False)
 pd.set_option("display.width", 160)
