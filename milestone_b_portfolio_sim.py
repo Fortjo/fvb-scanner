@@ -365,23 +365,31 @@ def simulate_portfolio(signals: list, close_matrix: pd.DataFrame,
                 p["shares"] * last_close.get(p_tk, p["entry_price"])
                 for p_tk, p in open_positions.items())
             equity_now = cash + positions_value
-            alloc_dollars = min(equity_now / max_positions, cash)
+            # [BUG FIX] budget caps the NOTIONAL only; the commission is
+            # charged on top of it (commission_min is a flat floor that
+            # doesn't shrink with share count), so a single one-share
+            # decrement isn't guaranteed to bring total_cost back under
+            # budget/cash -- found on the real full-universe run as cash
+            # dipping slightly negative (a few dollars) on ~1,000 days,
+            # concentrated exactly where all 15 slots were already full
+            # and the per-slot budget was thin relative to the $1 minimum
+            # commission. Fixed with a proper decrement loop that keeps
+            # shrinking shares until total_cost genuinely fits, rather
+            # than assuming one decrement is always enough.
+            budget = min(equity_now / max_positions, cash)
             buy_px = s["entry_price"] * (1 + slippage_bps / 10_000)
-            shares = int(alloc_dollars // buy_px) if buy_px > 0 else 0
-            if shares <= 0:
-                skipped_log.append({**s, "skip_reason": "insufficient_cash"})
-                continue
-            notional = shares * buy_px
-            entry_commission = max(commission_min, commission_bps / 10_000 * notional)
-            total_cost = notional + entry_commission
-            if total_cost > cash:
-                shares -= 1
-                if shares <= 0:
-                    skipped_log.append({**s, "skip_reason": "insufficient_cash"})
-                    continue
+            shares = int(budget // (buy_px * (1 + commission_bps / 10_000))) if buy_px > 0 else 0
+            notional = entry_commission = total_cost = 0.0
+            while shares > 0:
                 notional = shares * buy_px
                 entry_commission = max(commission_min, commission_bps / 10_000 * notional)
                 total_cost = notional + entry_commission
+                if total_cost <= budget + 1e-9:
+                    break
+                shares -= 1
+            if shares <= 0 or total_cost > cash + 1e-9:
+                skipped_log.append({**s, "skip_reason": "insufficient_cash"})
+                continue
             cash -= total_cost
             open_positions[tk] = {
                 "shares": shares, "entry_price": s["entry_price"], "entry_date": d,
@@ -588,6 +596,56 @@ def test_accounting_consistency():
     print(f"  PASSED: replay cash ({replay_cash:.2f}) + implied open-positions value "
           f"({implied_open_positions_value:.2f}) reconciles to final equity "
           f"({final_equity:.2f}).\n")
+
+
+def test_cash_never_negative_under_thin_budget():
+    """Regression test for the real bug found on the full-universe run:
+    with all MAX_POSITIONS slots full, the per-slot budget (equity /
+    MAX_POSITIONS) can be thin relative to the flat COMMISSION_MIN, and a
+    naive single-share decrement isn't always enough to bring total_cost
+    back under budget/cash. Deliberately constructs exactly that
+    situation: 15 pre-filled slots leaving a tiny remaining cash
+    cushion, then a 16th signal sized against that thin budget."""
+    dates = pd.date_range("2015-01-05", periods=400, freq="B")
+    n_fill = MAX_POSITIONS
+    tickers = [f"FIL{k}" for k in range(n_fill)] + ["THIN0"]
+    daily_by_ticker = {}
+    signals = []
+    # 15 positions that each consume a near-equal share of capital and
+    # never exit during the test window.
+    for k in range(n_fill):
+        tk = f"FIL{k}"
+        price = 1000.0
+        daily_by_ticker[tk] = pd.DataFrame(
+            {"Open": price, "High": price * 1.001, "Low": price * 0.999, "Close": price}, index=dates)
+        signals.append({
+            "ticker": tk, "signal_entry_week": dates[0], "signal_exit_week": dates[-1],
+            "entry_date": dates[0], "entry_price": price,
+            "exit_date": dates[-1], "exit_price": price,
+            "reason": "TP", "entry_exec": "ok", "exit_exec": "ok",
+        })
+    # A 16th ticker whose entry price is deliberately tiny -- a thin
+    # notional where COMMISSION_MIN=$1 is a large fraction of the
+    # trade, the exact regime the real bug showed up in.
+    thin_price = 0.50
+    daily_by_ticker["THIN0"] = pd.DataFrame(
+        {"Open": thin_price, "High": thin_price * 1.001, "Low": thin_price * 0.999, "Close": thin_price},
+        index=dates)
+    signals.append({
+        "ticker": "THIN0", "signal_entry_week": dates[1], "signal_exit_week": dates[-1],
+        "entry_date": dates[1], "entry_price": thin_price,
+        "exit_date": dates[-1], "exit_price": thin_price,
+        "reason": "TP", "entry_exec": "ok", "exit_exec": "ok",
+    })
+    close_matrix = build_close_matrix(daily_by_ticker)
+    daily_df, trades_df, skipped_df = simulate_portfolio(
+        signals, close_matrix, start_capital=15_050.0)  # just over 15 * $1000 -- a tight cushion
+    assert (daily_df["cash"] >= -1e-6).all(), (
+        f"FAILED: cash went negative (min={daily_df['cash'].min():.6f}) under a thin "
+        f"per-slot budget -- the real bug this test targets")
+    print("cash-never-negative-under-thin-budget test: 15 slots pre-filled, a 16th "
+          "thin-notional signal sized against a tight remaining cash cushion")
+    print(f"  PASSED: cash never negative (min cash = {daily_df['cash'].min():.6f}).\n")
 
 
 def test_position_limit_enforced():
@@ -798,6 +856,8 @@ def main():
     test_execution_timing_no_lookahead()
     print("Running cash-conservation test...\n")
     test_cash_conservation()
+    print("Running cash-never-negative-under-thin-budget test...\n")
+    test_cash_never_negative_under_thin_budget()
     print("Running accounting-consistency test...\n")
     test_accounting_consistency()
     print("Running position-limit-enforced test...\n")
