@@ -706,35 +706,62 @@ def run_real_universe(tickers: list):
 
     close_matrix = build_close_matrix(daily_by_ticker)
     daily_df, trades_df, skipped_df = simulate_portfolio(signals, close_matrix)
-    metrics = compute_metrics(daily_df, trades_df, START_CAPITAL)
+    # Full, UNFILTERED strategy performance across its whole available
+    # history (some tickers go back to 1970) -- kept as supplementary
+    # context, same convention as Milestone A's "preserve the unfiltered
+    # results" rule. This is NOT the SPY-comparable number -- see below.
+    metrics_full = compute_metrics(daily_df, trades_df, START_CAPITAL)
 
-    spy_weekly = bt.fetch(BENCHMARK_TICKER)
     spy_daily = bt.fetch_daily(BENCHMARK_TICKER)
+    daily_out = daily_df.copy()
     if spy_daily is not None and len(spy_daily):
         spy_close = spy_daily["Close"].reindex(daily_df.index, method="ffill")
         spy_eq = simulate_buy_and_hold(spy_close, START_CAPITAL)
-        spy_metrics = compute_metrics(
-            spy_eq.rename(columns={"equity": "equity"}).assign(open_positions=1),
-            pd.DataFrame(), START_CAPITAL)
+        daily_out["spy_equity"] = spy_eq["equity"].reindex(daily_out.index)
+
+        # [BUG FIX] item 8 requires "the SAME dates and starting capital".
+        # SPY didn't exist before its real inception (~1993), so
+        # spy_eq's own index only starts there (simulate_buy_and_hold
+        # drops the leading NaNs) while daily_df can start decades
+        # earlier for tickers with longer histories. Computing each
+        # side's CAGR/Sharpe/drawdown over its OWN full range (as an
+        # earlier version of this function did) silently compares two
+        # DIFFERENT date windows -- a real bug, not a minor rounding
+        # issue, since it was reported as date range 1970-2026 for the
+        # strategy with no indication next to SPY's 1993-2026 -- never
+        # trust a cross-strategy comparison without checking both
+        # sides' start_date/end_date match. Fixed: the actual vs-SPY
+        # comparison below is restricted to the overlap of both series'
+        # real availability, so both sides cover the identical window.
+        common_start = max(daily_df.index.min(), spy_eq.index.min())
+        common_end = min(daily_df.index.max(), spy_eq.index.max())
+        daily_window = daily_df.loc[(daily_df.index >= common_start) & (daily_df.index <= common_end)]
+        spy_window = spy_eq.loc[(spy_eq.index >= common_start) & (spy_eq.index <= common_end)]
+        trades_window = trades_df[(trades_df["exit_date"] >= common_start) &
+                                   (trades_df["exit_date"] <= common_end)] if len(trades_df) else trades_df
+        metrics_window = compute_metrics(daily_window, trades_window, daily_window["equity"].iloc[0])
+        spy_metrics = compute_metrics(spy_window.assign(open_positions=1), pd.DataFrame(), START_CAPITAL)
+        print(f"\nSPY-comparable window (both sides, identical dates): "
+              f"{common_start.date()} to {common_end.date()}", file=sys.stderr)
     else:
         print("SPY fetch failed -- no benchmark comparison possible", file=sys.stderr)
-        spy_eq, spy_metrics = None, {}
+        metrics_window, spy_metrics = {}, {}
 
     trades_df.to_csv("milestone_b_trades.csv", index=False)
-    daily_out = daily_df.copy()
-    if spy_eq is not None:
-        daily_out["spy_equity"] = spy_eq["equity"].reindex(daily_out.index)
     daily_out.to_csv("milestone_b_daily_equity.csv")
     if len(skipped_df):
         skipped_df.to_csv("milestone_b_skipped_signals.csv", index=False)
 
-    summary_rows = [{"metric": k, "strategy": v, "spy_buy_and_hold": spy_metrics.get(k, np.nan)}
-                     for k, v in metrics.items()]
+    all_keys = list(metrics_full.keys())
+    summary_rows = [{"metric": k, "strategy_full_history": metrics_full.get(k, np.nan),
+                      "strategy_vs_spy_window": metrics_window.get(k, np.nan),
+                      "spy_buy_and_hold_same_window": spy_metrics.get(k, np.nan)}
+                     for k in all_keys]
     summary_df = pd.DataFrame(summary_rows)
     summary_df.to_csv("milestone_b_summary.csv", index=False)
 
     pd.set_option("display.width", 160)
-    print("\n=== MILESTONE B PORTFOLIO BACKTEST vs SPY BUY-AND-HOLD ===")
+    print("\n=== MILESTONE B: STRATEGY FULL HISTORY, AND STRATEGY vs SPY (SAME WINDOW) ===")
     print(summary_df.to_string(index=False))
     print(f"\nSaved: milestone_b_trades.csv ({len(trades_df)} rows)")
     print(f"Saved: milestone_b_daily_equity.csv ({len(daily_out)} rows)")
@@ -742,7 +769,7 @@ def run_real_universe(tickers: list):
         print(f"Saved: milestone_b_skipped_signals.csv ({len(skipped_df)} rows) "
               f"-- {skipped_df['skip_reason'].value_counts().to_dict()}")
     print("Saved: milestone_b_summary.csv")
-    return daily_df, trades_df, skipped_df, metrics, spy_metrics
+    return daily_df, trades_df, skipped_df, metrics_full, metrics_window, spy_metrics
 
 
 # --------------------------------------------------------------------------
