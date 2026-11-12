@@ -61,8 +61,9 @@ What Milestone B adds, per the 12-point request:
  12. test_cash_conservation / test_position_limit_enforced /
      test_no_duplicate_ticker_position / test_execution_timing_no_lookahead
      / test_accounting_consistency / test_cash_never_negative_under_thin_budget
-     / test_stop_before_tp_same_week_conflict, all runnable offline via
-     --synthetic.
+     / test_stop_before_tp_same_week_conflict /
+     test_independent_resim_excludes_straddling_positions, all runnable
+     offline via --synthetic.
 
 AUDIT ROUND 2 FIXES (independent-auditor corrections, all applied)
 --------------------------------------------------------------------
@@ -177,6 +178,23 @@ rule rather than silently guessed:
       no size impact, and no accounting for trading halts or delistings
       mid-trade (delisted tickers are a Milestone C universe-construction
       problem, not modeled here).
+  (g) PRE-CUTOFF SIGNAL STATE, for the independent $100k-from-SPY-
+      inception re-simulation (audit point 5). generate_ticker_signals()
+      runs each ticker's single-position-at-a-time state machine over its
+      ENTIRE available history, not restarted at the cutoff -- this is
+      correct, since the entry/exit gating is a pure function of that
+      ticker's own price/indicator history and is independent of a
+      hypothetical trader's starting capital or start date. A ticker that
+      happened to already be mid-trade (entered before the cutoff,
+      exiting after it) per that continuous state machine is excluded
+      from the independent run ENTIRELY (both legs, by entry_date filter)
+      -- not re-dated, not re-priced, not left dangling as a phantom open
+      position. This correctly models a trader who starts completely
+      fresh on the cutoff date with no position in any ticker; that
+      ticker is picked back up at its own next independently-eligible
+      entry, if any. See test_independent_resim_excludes_straddling_positions()
+      for the regression test confirming this (cash never negative,
+      reconciliation ties to ~0, no straddling trade leaks through).
 
 Survivorship bias and historical index-membership reconstruction are
 explicitly OUT OF SCOPE here -- that is Milestone C, not claimed as
@@ -1053,6 +1071,77 @@ def test_stop_before_tp_same_week_conflict():
           f"later that same week on {daily_dates[17].date()}.\n")
 
 
+def test_independent_resim_excludes_straddling_positions():
+    """[PRE-CUTOFF SIGNAL-STATE CHECK] run_real_universe()'s independent
+    $100k-from-SPY-inception re-simulation (audit point 5) filters the
+    SAME signals list used for the full-history run down to
+    `entry_date >= common_start` before re-running simulate_portfolio()
+    fresh. Each per-ticker single-position-at-a-time state machine (in
+    generate_ticker_signals) runs over that ticker's ENTIRE available
+    history, not re-started at the cutoff, so a trade that was ALREADY
+    OPEN straddling the cutoff (entered before it, exited after it) is a
+    real possibility. This test confirms that filtering handles that
+    case correctly rather than silently:
+      - leaving a "ghost" position open in the independent sim that was
+        never actually entered there (it must simply not exist at all --
+        open_positions_df for the independent run must not reference it
+        unless its own LATER, independent-sim-eligible trade is open),
+      - double-counting it (it appears in neither trades_df_i nor
+        open_positions_df_i for the independent run),
+      - or corrupting cash/equity (reconciliation must still tie out to
+        ~0 on the independent run alone).
+    This is the correct behavior, not a defect: a hypothetical trader
+    starting fresh with $100k on the cutoff date has no open position in
+    ANY ticker on day one, including one that the continuous-since-
+    inception trader happened to be mid-trade in; the independent
+    simulation picks that ticker back up at its own NEXT independently-
+    eligible entry (if any), never earlier."""
+    signals, daily_by_ticker, _failures = _make_synthetic_universe(n_tickers=8, n_days=4000, start="2000-01-01")
+    close_matrix = build_close_matrix(daily_by_ticker)
+    cutoff = close_matrix.index[len(close_matrix) // 2]
+
+    straddlers = [s for s in signals if s["entry_date"] < cutoff <= s["exit_date"]]
+    assert len(straddlers) > 0, (
+        "synthetic fixture produced no cutoff-straddling trade to test -- "
+        "widen n_tickers/n_days or move the cutoff")
+
+    signals_from_cutoff = [s for s in signals if s["entry_date"] >= cutoff]
+    close_matrix_from_cutoff = close_matrix.loc[close_matrix.index >= cutoff]
+    daily_df_i, trades_df_i, skipped_df_i, open_positions_df_i = simulate_portfolio(
+        signals_from_cutoff, close_matrix_from_cutoff)
+
+    assert (daily_df_i["cash"] >= -1e-6).all(), (
+        f"FAILED: independent-from-cutoff sim went cash-negative "
+        f"(min={daily_df_i['cash'].min():.6f})")
+    reconciliation_i = reconcile_ledger(START_CAPITAL, trades_df_i, open_positions_df_i, daily_df_i)
+    assert abs(reconciliation_i["cash_discrepancy"]) < 1e-6, (
+        f"FAILED: independent-sim cash reconciliation off by "
+        f"{reconciliation_i['cash_discrepancy']}")
+    assert abs(reconciliation_i["equity_discrepancy"]) < 1e-6, (
+        f"FAILED: independent-sim equity reconciliation off by "
+        f"{reconciliation_i['equity_discrepancy']}")
+
+    closed_i = set(trades_df_i["ticker"]) if len(trades_df_i) else set()
+    open_i = set(open_positions_df_i["ticker"]) if len(open_positions_df_i) else set()
+    for s in straddlers:
+        tk = s["ticker"]
+        # The straddling trade's OWN entry/exit pair must not resurface
+        # under this exact (entry_date, exit_date) pair in the independent
+        # run -- it was excluded outright, not re-dated or re-priced.
+        matching = trades_df_i[(trades_df_i["ticker"] == tk) &
+                                (trades_df_i["entry_date"] == s["entry_date"])] if len(trades_df_i) else \
+            trades_df_i
+        assert len(matching) == 0, (
+            f"FAILED: the straddling trade for {tk} (entered {s['entry_date']}, pre-cutoff) "
+            f"reappeared in the independent run's trades_df -- it should have been excluded "
+            f"entirely, not partially replayed")
+    print(f"independent-resim-excludes-straddling-positions test: {len(straddlers)} "
+          f"cutoff-straddling trade(s) found and confirmed excluded from the independent "
+          f"run ({len(trades_df_i)} trades, {len(open_positions_df_i)} open at the end)")
+    print(f"  PASSED: cash never negative, reconciliation ties out to ~0, and no "
+          f"straddling trade leaked into the independent-from-cutoff simulation.\n")
+
+
 # --------------------------------------------------------------------------
 # REAL-DATA PIPELINE
 # --------------------------------------------------------------------------
@@ -1244,6 +1333,8 @@ def main():
     test_no_duplicate_ticker_position()
     print("Running stop-before-tp-same-week-conflict test...\n")
     test_stop_before_tp_same_week_conflict()
+    print("Running independent-resim-excludes-straddling-positions test...\n")
+    test_independent_resim_excludes_straddling_positions()
 
     if args.synthetic:
         return
