@@ -29,7 +29,11 @@ What Milestone B adds, per the 12-point request:
      price for every entry and exit from that week's actual daily bars,
      instead of trusting the weekly bar's aggregate OHLC (which can imply
      a fill on a day/at a price that couldn't actually have occurred in
-     that order). See the three _real_fill_for_* helpers.
+     that order). See the three _real_fill_for_* helpers. [AUDIT ROUND 2]
+     A weekly-implied trigger that no real daily bar can verify is never
+     filled with a fabricated price -- it is logged as a verification
+     failure (returned alongside the signals; see failures below) and
+     simply skipped, exactly like it never fired that week.
   3. simulate_portfolio() is real portfolio accounting: cash, integer
      shares, per-position cost basis, realized P&L on exit, unrealized
      mark-to-market on every open position every day.
@@ -51,10 +55,61 @@ What Milestone B adds, per the 12-point request:
      re-fits or re-optimizes FVB_LEN, bands, multipliers, or exit rules.
  10. See "ASSUMPTIONS THAT CANNOT BE RECONSTRUCTED FROM DAILY OHLC" below.
  11. main() saves milestone_b_trades.csv, milestone_b_daily_equity.csv,
-     milestone_b_summary.csv.
+     milestone_b_summary.csv, milestone_b_open_positions.csv,
+     milestone_b_reconciliation.csv, and (when any occurred)
+     milestone_b_verification_failures.csv.
  12. test_cash_conservation / test_position_limit_enforced /
      test_no_duplicate_ticker_position / test_execution_timing_no_lookahead
-     / test_accounting_consistency, all runnable offline via --synthetic.
+     / test_accounting_consistency / test_cash_never_negative_under_thin_budget
+     / test_stop_before_tp_same_week_conflict, all runnable offline via
+     --synthetic.
+
+AUDIT ROUND 2 FIXES (independent-auditor corrections, all applied)
+--------------------------------------------------------------------
+  1. OPEN-POSITIONS LEDGER + FULL RECONCILIATION. simulate_portfolio()
+     now returns a 4th value, open_positions_df: every still-open
+     position's ticker, shares, entry date, cost basis, current close,
+     market value and unrealized P&L as of the final simulated date. A
+     completed-trades-ONLY cash replay will always look "short" by
+     exactly the sum of all open positions' acquisition cost -- that is
+     correct (the cash genuinely left the account), not a bug, but easy
+     to misread without this ledger spelled out explicitly.
+     reconcile_ledger() computes the reconciled cash/equity from BOTH
+     completed trades AND open positions and reports the (should be
+     ~0) discrepancy against the simulator's own numbers.
+  2. NO FABRICATED FILLS. generate_ticker_signals() no longer has a
+     "fallback_weekly"/"fallback_weekly_mismatch" code path that
+     invented a fill price from the weekly bar's own label when daily
+     data couldn't verify a weekly-implied touch. Every entry_exec/
+     exit_exec in the output is now simply "ok" -- an unverifiable
+     trigger is logged (ticker, week, weekly OHLC, the daily bars
+     actually found, what WOULD have been used) in a separate
+     `failures` list and the trigger is skipped, not acted on.
+  3. STOP CHECKED BEFORE TP. The STOP condition is derived purely from
+     already-completed monthly data (via prep_v3) -- known before week
+     i's first trading day even opens. A TP condition only resolves
+     from intra-week price action. Checking TP first (an earlier
+     version of this file) could let a chronologically-impossible TP
+     override a STOP already known at the week's start; STOP is now
+     checked unconditionally first, with TP only in the elif branch.
+     See test_stop_before_tp_same_week_conflict() for an explicit
+     regression test of this exact conflict.
+  4. test_cash_never_negative_under_thin_budget() repaired: the
+     original version pre-filled all 15 MAX_POSITIONS slots, so its
+     16th signal was rejected at the max_positions check before ever
+     reaching the share-sizing/decrement loop it claimed to test. It
+     now pre-fills only 14 slots (one genuinely available) and sizes
+     the 15th signal so the naive share estimate must be decremented
+     more than once.
+  5. INDEPENDENT $100K-FROM-SPY-INCEPTION SIMULATION. In addition to
+     the illustrative linear rescale of the 1970-start equity curve
+     (final_equity_rescaled_to_100k_start), run_real_universe() now
+     also runs a genuinely SEPARATE simulate_portfolio() call starting
+     fresh with START_CAPITAL cash and no carried-over positions, on
+     signals/dates restricted to SPY's own real inception date onward
+     -- reported as its own column
+     (strategy_independent_100k_from_spy_inception), never conflated
+     with the rescale.
 
 ASSUMPTIONS THAT CANNOT BE RECONSTRUCTED FROM DAILY OHLC
 ----------------------------------------------------------
@@ -98,10 +153,17 @@ rule rather than silently guessed:
       implies a touch (e.g. weekly low <= band_px) but no single daily
       bar inside that week's real window actually reaches it (vendor
       adjustment-timing differences between the weekly and daily feeds --
-      see milestone_a_engine_fix.verify_weekly_windows), the fill falls
-      back to the weekly bar's own open/label, flagged with
-      exec="fallback_weekly_mismatch" in the signals/trades output rather
-      than silently using a fabricated daily date.
+      see milestone_a_engine_fix.verify_weekly_windows), [AUDIT ROUND 2]
+      the trigger is simply NOT acted on -- no trade is recorded on
+      unverifiable evidence. It is logged, with the weekly OHLC and
+      whatever daily bars were actually found, in generate_ticker_signals()'s
+      `failures` return value (saved to milestone_b_verification_failures.csv
+      by run_real_universe()), and scanning continues at the next week
+      exactly as if this week's trigger had not fired. An earlier version
+      of this file instead fell back to the weekly bar's own open/label as
+      a fabricated fill -- an independent audit correctly identified this
+      as manufacturing an execution the data couldn't support, so it was
+      removed entirely.
   (e) POSITION SIZING BASIS. New entries are sized as (current equity /
       MAX_POSITIONS), using the equity marked at the PRIOR trading day's
       close -- never the fill day's own close, which isn't knowable at
@@ -151,16 +213,45 @@ BENCHMARK_TICKER = "SPY"
 # --------------------------------------------------------------------------
 # SIGNAL GENERATION -- frozen weekly decision logic, real daily fills
 # --------------------------------------------------------------------------
-def generate_ticker_signals(ticker: str, df_weekly: pd.DataFrame, df_daily: pd.DataFrame) -> list[dict]:
+def generate_ticker_signals(ticker: str, df_weekly: pd.DataFrame, df_daily: pd.DataFrame):
     """Mirrors backtest_33fvb.run()'s decision logic EXACTLY for BAND/
     EXIT_MODE (which week triggers an entry/exit, and at what target
     prices) -- but replaces the weekly-bar-only fill price with a REAL
     fill reconstructed from that week's actual daily bars. Does not touch
-    portfolio-level accounting; returns a flat list of trade-signal dicts.
+    portfolio-level accounting.
+
+    [AUDIT FIX] Never manufactures a fill when the daily data can't
+    verify one. If a weekly-level trigger (entry touch, TP touch) fires
+    but no real daily bar inside that week's window actually supports
+    it, this is logged as a verification FAILURE (with the weekly OHLC,
+    the daily bars actually found, and what fill WOULD have been used)
+    and the trigger is simply skipped this week -- no trade is recorded
+    on unverifiable evidence. Scanning continues at the next week exactly
+    as if this week's trigger had not fired. STOP exits never hit this
+    path in practice (they fill at the week's own real first trading
+    day's open, which only fails when that day genuinely doesn't exist
+    in the data -- itself logged, not papered over).
+
+    [AUDIT FIX] STOP is checked BEFORE TP within the same week. The STOP
+    condition is derived purely from already-completed monthly data (via
+    prep_v3) -- it is known before week i's first trading day even
+    opens. A TP condition only resolves from INTRA-week price action, so
+    if STOP applies, the position would have been closed at that week's
+    open before any later-in-the-week TP touch could matter. Checking TP
+    first (as an earlier version of this file did) could let a
+    chronologically-impossible TP override a STOP that was already known
+    at the start of the week -- exactly the ordering bug flagged by
+    the audit.
+
+    Returns (signals, failures): signals is the list of trade-signal
+    dicts (entry_exec/exit_exec are always "ok" now -- no fallback
+    category exists any more); failures is a list of verification-
+    failure dicts for manual review.
     """
     exec_dates = mae._exec_dates(df_weekly.index, df_daily.index)
     daily_index = df_daily.index
     n_weeks = len(df_weekly)
+    failures = []
 
     def _daily_window(i):
         """Real daily bars inside weekly bar i's own window, via the same
@@ -179,31 +270,49 @@ def generate_ticker_signals(ticker: str, df_weekly: pd.DataFrame, df_daily: pd.D
             return None
         return df_daily.iloc[start_pos:end_pos]
 
+    def _log_failure(i, kind, level, sub):
+        failures.append({
+            "ticker": ticker, "week": df_weekly.index[i], "kind": kind,
+            "band_or_target": level,
+            "weekly_open": o[i], "weekly_high": hgh[i], "weekly_low": lw[i], "weekly_close": cl[i],
+            "daily_bars_found": 0 if sub is None else len(sub),
+            "daily_first_open": None if sub is None or len(sub) == 0 else sub["Open"].iloc[0],
+            "daily_last_close": None if sub is None or len(sub) == 0 else sub["Close"].iloc[-1],
+            "daily_max_high": None if sub is None or len(sub) == 0 else sub["High"].max(),
+            "daily_min_low": None if sub is None or len(sub) == 0 else sub["Low"].min(),
+        })
+
     def _real_fill_for_entry(i, band_px):
+        """Returns (date, price) on a verified fill, or None if the
+        daily data can't verify the weekly-implied touch."""
         sub = _daily_window(i)
         if sub is None or len(sub) == 0:
-            return df_weekly.index[i], min(o[i], band_px), "fallback_weekly"
+            _log_failure(i, "entry", band_px, sub)
+            return None
         first_open = sub["Open"].iloc[0]
         if first_open <= band_px:
-            return sub.index[0], first_open, "ok"
+            return sub.index[0], first_open
         touch = sub[sub["Low"] <= band_px]
         if len(touch):
             d0 = touch.index[0]
-            return d0, band_px, "ok"
-        return df_weekly.index[i], min(o[i], band_px), "fallback_weekly_mismatch"
+            return d0, band_px
+        _log_failure(i, "entry", band_px, sub)
+        return None
 
     def _real_fill_for_tp(i, target):
         sub = _daily_window(i)
         if sub is None or len(sub) == 0:
-            return df_weekly.index[i], max(o[i], target), "fallback_weekly"
+            _log_failure(i, "tp", target, sub)
+            return None
         first_open = sub["Open"].iloc[0]
         if first_open >= target:
-            return sub.index[0], first_open, "ok"
+            return sub.index[0], first_open
         touch = sub[sub["High"] >= target]
         if len(touch):
             d0 = touch.index[0]
-            return d0, max(sub.loc[d0, "Open"], target), "ok"
-        return df_weekly.index[i], max(o[i], target), "fallback_weekly_mismatch"
+            return d0, max(sub.loc[d0, "Open"], target)
+        _log_failure(i, "tp", target, sub)
+        return None
 
     def _real_fill_for_stop(i):
         # Known going INTO week i (derived purely from already-completed
@@ -211,8 +320,9 @@ def generate_ticker_signals(ticker: str, df_weekly: pd.DataFrame, df_daily: pd.D
         # that week's real first trading day's open. See docstring (c).
         sub = _daily_window(i)
         if sub is None or len(sub) == 0:
-            return df_weekly.index[i], cl[i], "fallback_weekly"
-        return sub.index[0], sub["Open"].iloc[0], "ok"
+            _log_failure(i, "stop", np.nan, sub)
+            return None
+        return sub.index[0], sub["Open"].iloc[0]
 
     frac = bt.BAND_FRACS[BAND]
     o, hgh, lw, cl = (df_weekly[c].values for c in ["Open", "High", "Low", "Close"])
@@ -227,28 +337,36 @@ def generate_ticker_signals(ticker: str, df_weekly: pd.DataFrame, df_daily: pd.D
     in_pos = False
     entry_i = -1
     entry_real_date = entry_real_px = None
-    entry_exec_note = None
     entry_tp_target = np.nan
 
     for i in range(n_weeks):
         if in_pos and i > entry_i:
-            exit_date = exit_px = reason = exec_note = None
-            if EXIT_MODE == "NBarHigh":
-                if not np.isnan(entry_tp_target) and hgh[i] >= entry_tp_target:
-                    exit_date, exit_px, exec_note = _real_fill_for_tp(i, entry_tp_target)
-                    reason = "TP"
-            if exit_date is None:
-                stopped = not green[i]  # STOP_DEF == "basis_slope", the frozen default
-                if stopped:
-                    exit_date, exit_px, exec_note = _real_fill_for_stop(i)
+            exit_date = exit_px = reason = None
+            # [AUDIT FIX] STOP checked FIRST -- it's known before this
+            # week's trading even starts, so it cannot be overridden by
+            # a TP that only resolves from this week's own price action.
+            stopped = not green[i]  # STOP_DEF == "basis_slope", the frozen default
+            if stopped:
+                fill = _real_fill_for_stop(i)
+                if fill is not None:
+                    exit_date, exit_px = fill
                     reason = "STOP"
+                # If the STOP fill itself can't be verified (logged
+                # above), we do NOT fall through to check TP this week --
+                # a STOP we can't verify is not evidence a TP should have
+                # fired instead. Just hold and re-check next week.
+            elif EXIT_MODE == "NBarHigh" and not np.isnan(entry_tp_target) and hgh[i] >= entry_tp_target:
+                fill = _real_fill_for_tp(i, entry_tp_target)
+                if fill is not None:
+                    exit_date, exit_px = fill
+                    reason = "TP"
             if exit_date is not None:
                 signals.append({
                     "ticker": ticker,
                     "signal_entry_week": idx[entry_i], "signal_exit_week": idx[i],
                     "entry_date": entry_real_date, "entry_price": float(entry_real_px),
                     "exit_date": exit_date, "exit_price": float(exit_px),
-                    "reason": reason, "entry_exec": entry_exec_note, "exit_exec": exec_note,
+                    "reason": reason, "entry_exec": "ok", "exit_exec": "ok",
                 })
                 in_pos = False
                 continue
@@ -261,9 +379,15 @@ def generate_ticker_signals(ticker: str, df_weekly: pd.DataFrame, df_daily: pd.D
         if (not in_pos) and green[i] == True and not np.isnan(band_px) \
                 and lw[i] <= band_px and i > 0 and not np.isnan(prior_band_px) \
                 and cl[i - 1] > prior_band_px:                      # noqa: E712
-            real_date, real_px, exec_note = _real_fill_for_entry(i, band_px)
+            fill = _real_fill_for_entry(i, band_px)
+            if fill is None:
+                # Unverifiable -- this week's entry opportunity is
+                # skipped (logged above), not fabricated. in_pos stays
+                # False; the NEXT week's own (independent) gating
+                # conditions are evaluated fresh at i+1.
+                continue
+            entry_real_date, entry_real_px = fill
             entry_i, in_pos = i, True
-            entry_real_date, entry_real_px, entry_exec_note = real_date, real_px, exec_note
             hh_missing = np.isnan(prev_hh[i])
             hh_stale = (not hh_missing) and (prev_hh[i] > entry_real_px * 2.5)
             if (hh_missing or hh_stale) and i > 0:
@@ -276,7 +400,7 @@ def generate_ticker_signals(ticker: str, df_weekly: pd.DataFrame, df_daily: pd.D
                     entry_tp_target = prev_hh[i]
             else:
                 entry_tp_target = prev_hh[i]
-    return signals
+    return signals, failures
 
 
 # --------------------------------------------------------------------------
@@ -415,7 +539,67 @@ def simulate_portfolio(signals: list, close_matrix: pd.DataFrame,
     daily_df = pd.DataFrame(daily_rows).set_index("date")
     trades_df = pd.DataFrame(trade_log)
     skipped_df = pd.DataFrame(skipped_log)
-    return daily_df, trades_df, skipped_df
+
+    # [AUDIT FIX] explicit open-positions ledger at the end of the run,
+    # so cash + completed trades alone is never mistaken for the whole
+    # picture: any STILL-OPEN position's acquisition cost already left
+    # cash (it's not in trades_df, which only holds CLOSED trades) and
+    # its current mark-to-market value is part of "equity" but not of
+    # "cash". Reconciliation (see reconcile_ledger()): START_CAPITAL -
+    # sum(completed cost_basis) + sum(completed net_proceeds) -
+    # sum(open cost_basis) == final cash, and final cash + sum(open
+    # market_value) == final equity.
+    open_rows = []
+    final_date = calendar[-1] if len(calendar) else None
+    for tk, pos in open_positions.items():
+        close_px = close_matrix.loc[final_date, tk] if (final_date is not None and tk in close_matrix.columns) else np.nan
+        if pd.isna(close_px):
+            close_px = last_close.get(tk, pos["entry_price"])
+        open_rows.append({
+            "ticker": tk, "shares": pos["shares"], "entry_date": pos["entry_date"],
+            "entry_price": pos["entry_price"], "cost_basis": pos["cost_basis"],
+            "entry_commission": pos["entry_commission"], "entry_slippage_cost": pos["entry_slippage_cost"],
+            "as_of_date": final_date, "current_close": close_px,
+            "market_value": pos["shares"] * close_px,
+            "unrealized_pnl_dollars": pos["shares"] * close_px - pos["cost_basis"],
+        })
+    open_positions_df = pd.DataFrame(open_rows)
+    return daily_df, trades_df, skipped_df, open_positions_df
+
+
+def reconcile_ledger(start_capital: float, trades_df: pd.DataFrame, open_positions_df: pd.DataFrame,
+                      daily_df: pd.DataFrame) -> dict:
+    """[AUDIT FIX] Explicit reconciliation using BOTH completed trades AND
+    still-open positions -- a completed-trades-ONLY replay will always
+    look like it's "missing" exactly the open positions' total
+    acquisition cost, which is correct (that cash genuinely left the
+    account) but easy to misread as a bug if the open side isn't
+    accounted for explicitly. Returns the reconciled figures and the
+    (should be ~0) discrepancy against the simulator's own final cash/equity."""
+    realized_cash_delta = 0.0
+    if len(trades_df):
+        realized_cash_delta = (trades_df["net_proceeds"] - trades_df["cost_basis"]).sum()
+    open_cost_total = open_positions_df["cost_basis"].sum() if len(open_positions_df) else 0.0
+    open_mv_total = open_positions_df["market_value"].sum() if len(open_positions_df) else 0.0
+
+    reconciled_cash = start_capital + realized_cash_delta - open_cost_total
+    reconciled_equity = reconciled_cash + open_mv_total
+
+    actual_cash = daily_df["cash"].iloc[-1] if len(daily_df) else np.nan
+    actual_equity = daily_df["equity"].iloc[-1] if len(daily_df) else np.nan
+
+    return {
+        "start_capital": start_capital,
+        "realized_cash_delta_from_completed_trades": realized_cash_delta,
+        "open_positions_cost_basis_total": open_cost_total,
+        "open_positions_market_value_total": open_mv_total,
+        "reconciled_cash": reconciled_cash,
+        "actual_cash": actual_cash,
+        "cash_discrepancy": reconciled_cash - actual_cash,
+        "reconciled_equity": reconciled_equity,
+        "actual_equity": actual_equity,
+        "equity_discrepancy": reconciled_equity - actual_equity,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -481,16 +665,20 @@ def simulate_buy_and_hold(close_series: pd.Series, start_capital: float = START_
 def _make_synthetic_universe(n_tickers=6, n_days=4000, start="2010-01-01"):
     """A handful of independent synthetic tickers (different seeds), each
     run through prep_v3 and generate_ticker_signals. Returns
-    (signals, daily_by_ticker) ready for simulate_portfolio/build_close_matrix."""
+    (signals, daily_by_ticker, failures) ready for
+    simulate_portfolio/build_close_matrix."""
     signals = []
+    failures = []
     daily_by_ticker = {}
     for k in range(n_tickers):
         tk = f"SYN{k}"
         daily, weekly_monday, _ = mae._make_synthetic(n_days=n_days, seed=100 + k, start=start)
         prepped, _monthly = mae.prep_v3(weekly_monday, daily)
-        signals.extend(generate_ticker_signals(tk, prepped, daily))
+        tk_signals, tk_failures = generate_ticker_signals(tk, prepped, daily)
+        signals.extend(tk_signals)
+        failures.extend(tk_failures)
         daily_by_ticker[tk] = daily
-    return signals, daily_by_ticker
+    return signals, daily_by_ticker, failures
 
 
 # --------------------------------------------------------------------------
@@ -503,7 +691,7 @@ def test_execution_timing_no_lookahead():
     exit always strictly after entry, and a TP fill's daily bar must
     genuinely satisfy the touch condition (no fabricated date standing in
     for one that didn't really happen)."""
-    signals, daily_by_ticker = _make_synthetic_universe(n_tickers=8, n_days=4000)
+    signals, daily_by_ticker, _failures = _make_synthetic_universe(n_tickers=8, n_days=4000)
     assert len(signals) > 0, "synthetic universe produced no signals at all -- cannot test timing"
     checked = 0
     for s in signals:
@@ -542,9 +730,9 @@ def test_execution_timing_no_lookahead():
 def test_cash_conservation():
     """Cash must never go negative at any point in the simulation --
     nothing is ever spent that the portfolio doesn't have."""
-    signals, daily_by_ticker = _make_synthetic_universe(n_tickers=10, n_days=4000)
+    signals, daily_by_ticker, _failures = _make_synthetic_universe(n_tickers=10, n_days=4000)
     close_matrix = build_close_matrix(daily_by_ticker)
-    daily_df, trades_df, skipped_df = simulate_portfolio(signals, close_matrix)
+    daily_df, trades_df, skipped_df, open_positions_df = simulate_portfolio(signals, close_matrix)
     assert (daily_df["cash"] >= -1e-6).all(), (
         f"FAILED: cash went negative on {daily_df[daily_df['cash'] < 0].index.tolist()[:5]}")
     print(f"cash-conservation test: {len(daily_df)} trading days, "
@@ -559,9 +747,9 @@ def test_accounting_consistency():
     value of still-open positions, as the simulator's own daily equity
     series -- proving the running ledger isn't silently drifting from
     what the trades actually imply."""
-    signals, daily_by_ticker = _make_synthetic_universe(n_tickers=10, n_days=4000)
+    signals, daily_by_ticker, _failures = _make_synthetic_universe(n_tickers=10, n_days=4000)
     close_matrix = build_close_matrix(daily_by_ticker)
-    daily_df, trades_df, skipped_df = simulate_portfolio(signals, close_matrix)
+    daily_df, trades_df, skipped_df, open_positions_df = simulate_portfolio(signals, close_matrix)
 
     replay_cash = START_CAPITAL
     for _, t in trades_df.iterrows():
@@ -600,33 +788,50 @@ def test_accounting_consistency():
 
 def test_cash_never_negative_under_thin_budget():
     """Regression test for the real bug found on the full-universe run:
-    with all MAX_POSITIONS slots full, the per-slot budget (equity /
-    MAX_POSITIONS) can be thin relative to the flat COMMISSION_MIN, and a
-    naive single-share decrement isn't always enough to bring total_cost
-    back under budget/cash. Deliberately constructs exactly that
-    situation: 15 pre-filled slots leaving a tiny remaining cash
-    cushion, then a 16th signal sized against that thin budget."""
+    with the per-slot budget (equity / MAX_POSITIONS) thin relative to
+    the flat COMMISSION_MIN, a naive single-share decrement isn't always
+    enough to bring total_cost back under budget/cash.
+
+    [AUDIT FIX] The original version of this test pre-filled all 15
+    MAX_POSITIONS slots, so the 16th ("thin") signal was rejected at the
+    `len(open_positions) >= max_positions` check before it ever reached
+    the share-sizing/decrement loop -- it never actually exercised the
+    code path it claimed to test. Fixed by pre-filling only
+    MAX_POSITIONS - 1 = 14 slots, leaving ONE slot genuinely available,
+    and sizing the 15th ("THIN0") ticker's price so that the naive
+    initial share estimate (computed ignoring COMMISSION_MIN's flat
+    floor) overshoots the actual per-slot budget by more than one
+    share's worth -- i.e. a single decrement is not sufficient and the
+    loop must iterate more than once to converge. The exact numbers
+    below were derived by direct simulation of this module's own sizing
+    formula. 14 fillers at $10/share from a $500 start leave a $245.88
+    cash cushion after day 0; THIN0 enters the NEXT trading day, so its
+    budget is based on equity marked-to-market with the fillers' own
+    close price already included (assumption (e)) -- $485.88 equity,
+    giving a $32.39 one-slot budget. Against that budget, THIN0 at
+    $0.50/share has a naive estimate of 64 shares, which the loop must
+    decrement TWICE, to 62 shares, before total_cost <= budget."""
     dates = pd.date_range("2015-01-05", periods=400, freq="B")
-    n_fill = MAX_POSITIONS
+    n_fill = MAX_POSITIONS - 1          # leaves exactly one slot open
     tickers = [f"FIL{k}" for k in range(n_fill)] + ["THIN0"]
     daily_by_ticker = {}
     signals = []
-    # 15 positions that each consume a near-equal share of capital and
-    # never exit during the test window.
+    filler_price = 10.0
     for k in range(n_fill):
         tk = f"FIL{k}"
-        price = 1000.0
         daily_by_ticker[tk] = pd.DataFrame(
-            {"Open": price, "High": price * 1.001, "Low": price * 0.999, "Close": price}, index=dates)
+            {"Open": filler_price, "High": filler_price * 1.001, "Low": filler_price * 0.999,
+             "Close": filler_price}, index=dates)
         signals.append({
             "ticker": tk, "signal_entry_week": dates[0], "signal_exit_week": dates[-1],
-            "entry_date": dates[0], "entry_price": price,
-            "exit_date": dates[-1], "exit_price": price,
+            "entry_date": dates[0], "entry_price": filler_price,
+            "exit_date": dates[-1], "exit_price": filler_price,
             "reason": "TP", "entry_exec": "ok", "exit_exec": "ok",
         })
-    # A 16th ticker whose entry price is deliberately tiny -- a thin
-    # notional where COMMISSION_MIN=$1 is a large fraction of the
-    # trade, the exact regime the real bug showed up in.
+    # The 15th ticker: an available slot, but a naive initial share
+    # count (ignoring the $1 flat commission floor) that overshoots the
+    # thin remaining per-slot budget by more than one share's cost --
+    # forcing the decrement loop to iterate more than once.
     thin_price = 0.50
     daily_by_ticker["THIN0"] = pd.DataFrame(
         {"Open": thin_price, "High": thin_price * 1.001, "Low": thin_price * 0.999, "Close": thin_price},
@@ -638,14 +843,35 @@ def test_cash_never_negative_under_thin_budget():
         "reason": "TP", "entry_exec": "ok", "exit_exec": "ok",
     })
     close_matrix = build_close_matrix(daily_by_ticker)
-    daily_df, trades_df, skipped_df = simulate_portfolio(
-        signals, close_matrix, start_capital=15_050.0)  # just over 15 * $1000 -- a tight cushion
+    daily_df, trades_df, skipped_df, open_positions_df = simulate_portfolio(
+        signals, close_matrix, start_capital=500.0)
     assert (daily_df["cash"] >= -1e-6).all(), (
         f"FAILED: cash went negative (min={daily_df['cash'].min():.6f}) under a thin "
         f"per-slot budget -- the real bug this test targets")
-    print("cash-never-negative-under-thin-budget test: 15 slots pre-filled, a 16th "
-          "thin-notional signal sized against a tight remaining cash cushion")
-    print(f"  PASSED: cash never negative (min cash = {daily_df['cash'].min():.6f}).\n")
+    # Confirm THIN0 actually got an open position (the available slot
+    # was used, not rejected at max_positions) AND that it was sized
+    # below the naive single-share-decrement estimate -- i.e. the loop
+    # really did decrement more than once, not just zero or one time.
+    thin_open = open_positions_df[open_positions_df["ticker"] == "THIN0"] if len(open_positions_df) else \
+        pd.DataFrame()
+    thin_closed = trades_df[trades_df["ticker"] == "THIN0"] if len(trades_df) else pd.DataFrame()
+    assert len(thin_open) == 1 or len(thin_closed) == 1, (
+        "FAILED: THIN0's entry was never actually filled -- the available 15th slot "
+        "was not used, so this test isn't exercising the decrement loop at all")
+    thin_shares = thin_open["shares"].iloc[0] if len(thin_open) else thin_closed["shares"].iloc[0]
+    # Assert directly against the known-by-construction numbers derived above:
+    # the naive (commission-floor-ignoring) estimate was 64 shares, and the
+    # decrement loop must have shrunk that to 62 shares to fit the budget.
+    assert thin_shares == 62, (
+        f"FAILED: THIN0 bought {thin_shares} shares, expected exactly 62 (naive floor-only "
+        f"estimate was 64, the decrement loop should shrink it by exactly 2); if this test's "
+        f"constants changed, re-derive the expected count by direct simulation rather than "
+        f"loosening this bound")
+    print("cash-never-negative-under-thin-budget test: 14 slots pre-filled (one left open), "
+          "a 15th thin-notional signal sized against a tight remaining cash cushion")
+    print(f"  PASSED: cash never negative (min cash = {daily_df['cash'].min():.6f}); "
+          f"THIN0 filled at {thin_shares} shares (naive-floor estimate was 64, "
+          f"so the decrement loop ran exactly twice).\n")
 
 
 def test_position_limit_enforced():
@@ -671,7 +897,7 @@ def test_position_limit_enforced():
             "reason": "TP", "entry_exec": "ok", "exit_exec": "ok",
         })
     close_matrix = build_close_matrix(daily_by_ticker)
-    daily_df, trades_df, skipped_df = simulate_portfolio(signals, close_matrix)
+    daily_df, trades_df, skipped_df, open_positions_df = simulate_portfolio(signals, close_matrix)
 
     assert daily_df["open_positions"].max() <= MAX_POSITIONS, (
         f"FAILED: open_positions peaked at {daily_df['open_positions'].max()}, "
@@ -708,7 +934,7 @@ def test_no_duplicate_ticker_position():
          "reason": "TP", "entry_exec": "ok", "exit_exec": "ok"},
     ]
     close_matrix = build_close_matrix(daily_by_ticker)
-    daily_df, trades_df, skipped_df = simulate_portfolio(signals, close_matrix)
+    daily_df, trades_df, skipped_df, open_positions_df = simulate_portfolio(signals, close_matrix)
     assert daily_df["open_positions"].max() <= 1, (
         f"FAILED: {tk} somehow held more than one concurrent position "
         f"(peak {daily_df['open_positions'].max()})")
@@ -720,6 +946,113 @@ def test_no_duplicate_ticker_position():
           "(ticker_already_open), never opening a second concurrent position.\n")
 
 
+def test_stop_before_tp_same_week_conflict():
+    """[AUDIT FIX #3] Explicit daily-chronological regression test for the
+    STOP-vs-TP ordering bug. Directly hand-builds a weekly df (bypassing
+    prep_v3, since only generate_ticker_signals()'s own ordering logic is
+    under test here) with four weeks:
+      week0: sets up the prior-week-close-above-band condition.
+      week1: entry week (fills at that week's real first daily bar).
+      week2: holds; neither STOP nor TP condition is met.
+      week3: THE CONFLICT WEEK -- green flips False (STOP is known the
+             INSTANT this week starts, from already-completed monthly
+             data) AND the week's own aggregate High also reaches the
+             TP target (115 >= entry_tp_target of 110) -- so a TP-first
+             implementation would ALSO fire this week, from price action
+             that only resolves on Wednesday (this week's 3rd daily
+             bar), two real trading days after the STOP was already
+             knowable at Monday's open.
+
+    A correct implementation must close the position at week3's real
+    first trading day's OPEN (Monday, price 95 -- the STOP fill) and
+    must NOT use Wednesday's TP-style fill (price 110, the week's own
+    TP target) even though the weekly-aggregate TP condition is also
+    satisfied that week. This is exactly the conflict the audit flagged:
+    "A STOP known before the week begins ... must not be overridden by
+    a TP touched later in that week."
+    """
+    weekly_dates = pd.to_datetime(["2015-01-05", "2015-01-12", "2015-01-19", "2015-01-26"])
+    daily_dates = pd.bdate_range("2015-01-05", periods=20)  # 4 weeks x 5 business days
+
+    # Week 1 (entry week) daily bars: day0's open (101.5) already satisfies
+    # the entry band (102), so entry fills there, price 101.5.
+    week1_daily = pd.DataFrame({
+        "Open":  [101.5, 101.8, 102.5, 103.5, 104.5],
+        "High":  [102.0, 103.0, 104.0, 105.0, 106.0],
+        "Low":   [101.0, 101.5, 102.0, 103.0, 104.0],
+        "Close": [101.8, 102.5, 103.5, 104.5, 105.5],
+    }, index=daily_dates[5:10])
+
+    # Week 3 (the conflict week) daily bars: Monday's open (95) is the
+    # STOP fill. Wednesday's High (115) is what would have been a TP
+    # touch (target 110) had TP been (wrongly) checked instead/first.
+    week3_daily = pd.DataFrame({
+        "Open":  [95.0,  96.0,  97.0,  112.0, 112.0],
+        "High":  [96.0,  97.0,  115.0, 113.0, 114.0],
+        "Low":   [94.0,  95.0,  96.0,  111.0, 111.0],
+        "Close": [95.5,  96.5,  112.0, 112.5, 113.0],
+    }, index=daily_dates[15:20])
+
+    # Weeks 0 and 2: cosmetic filler bars, never looked up for a fill in
+    # this test (week 0 can't trigger entry, "i > 0" gates that; week 2
+    # triggers neither STOP nor TP so no fill lookup happens there either).
+    week0_daily = pd.DataFrame({
+        "Open": [100.0, 101.0, 102.0, 103.0, 104.0],
+        "High": [101.0, 102.0, 103.0, 104.0, 106.0],
+        "Low":  [99.0, 100.0, 101.0, 102.0, 103.0],
+        "Close": [100.5, 101.5, 102.5, 103.5, 105.0],
+    }, index=daily_dates[0:5])
+    week2_daily = pd.DataFrame({
+        "Open": [105.5, 106.0, 106.5, 107.0, 107.5],
+        "High": [106.5, 107.0, 107.5, 108.0, 108.0],
+        "Low":  [105.0, 105.5, 106.0, 106.5, 107.0],
+        "Close": [106.0, 106.5, 107.0, 107.5, 108.0],
+    }, index=daily_dates[10:15])
+
+    daily_df_input = pd.concat([week0_daily, week1_daily, week2_daily, week3_daily]).sort_index()
+
+    weekly_df = pd.DataFrame({
+        "Open":   [100.0, 101.5, 105.5, 95.0],
+        "High":   [106.0, 106.0, 108.0, 115.0],
+        "Low":    [99.0, 101.0, 105.0, 94.0],
+        "Close":  [105.0, 105.5, 107.0, 113.0],
+        "basis":  [np.nan] * 4,
+        "upperR": [100.0, 102.0, np.nan, np.nan],
+        "lowerR": [np.nan] * 4,
+        "green":  [1.0, 1.0, 1.0, 0.0],          # week3: green flips False -> STOP known at week-open
+        "lowerB": [np.nan] * 4,
+        "pivot_conf": [np.nan] * 4,
+        "prev_hh": [np.nan, 110.0, 110.0, np.nan],  # entry_tp_target becomes 110 at entry (week1)
+    }, index=weekly_dates)
+
+    signals, failures = generate_ticker_signals("CONFLICT0", weekly_df, daily_df_input)
+
+    assert len(failures) == 0, (
+        f"FAILED: unexpected verification failures (the STOP fill should be fully "
+        f"verifiable from week3's real first daily bar): {failures}")
+    assert len(signals) == 1, f"FAILED: expected exactly 1 signal (entry+exit), got {len(signals)}"
+    sig = signals[0]
+    assert sig["entry_price"] == 101.5 and sig["entry_date"] == daily_dates[5], (
+        f"FAILED: entry fill wasn't as expected -- got {sig['entry_date']} @ {sig['entry_price']}")
+    assert sig["reason"] == "STOP", (
+        f"FAILED: exit reason was {sig['reason']!r}, expected 'STOP' -- the week's TP "
+        f"condition (high 115 >= target 110) was also satisfied, so a TP-first "
+        f"implementation would wrongly report 'TP' here")
+    assert sig["exit_date"] == daily_dates[15], (
+        f"FAILED: STOP exit dated {sig['exit_date']}, expected week3's real first "
+        f"trading day {daily_dates[15]} (the Monday open, known before the week's own "
+        f"price action) -- not a later day a TP-style fill would have picked")
+    assert sig["exit_price"] == 95.0, (
+        f"FAILED: STOP exit priced at {sig['exit_price']}, expected week3's real first "
+        f"trading day's open (95.0) -- NOT the TP target (110.0) that Wednesday's high "
+        f"would also have satisfied")
+    print("stop-before-tp-same-week-conflict test: a week where green flips False (STOP) "
+          "AND the weekly High also reaches the TP target, checked")
+    print(f"  PASSED: exit resolved to STOP at {sig['exit_date'].date()} @ {sig['exit_price']} "
+          f"(Monday's open), correctly NOT overridden by the TP target (110.0) touched "
+          f"later that same week on {daily_dates[17].date()}.\n")
+
+
 # --------------------------------------------------------------------------
 # REAL-DATA PIPELINE
 # --------------------------------------------------------------------------
@@ -729,6 +1062,7 @@ def run_real_universe(tickers: list):
     portfolio together with a true daily mark-to-market equity curve,
     compared against SPY buy-and-hold over the same dates/capital."""
     signals = []
+    all_failures = []
     daily_by_ticker = {}
     skipped_tickers = []
     for i, tk in enumerate(tickers):
@@ -753,17 +1087,25 @@ def run_real_universe(tickers: list):
             print(f"{tk}: too short after warmup", file=sys.stderr)
             skipped_tickers.append(tk)
             continue
-        tk_signals = generate_ticker_signals(tk, prepped, daily)
+        tk_signals, tk_failures = generate_ticker_signals(tk, prepped, daily)
         signals.extend(tk_signals)
+        all_failures.extend(tk_failures)
         daily_by_ticker[tk] = daily
-        print(f"[{i+1}/{len(tickers)}] {tk}: {len(tk_signals)} signals", file=sys.stderr)
+        print(f"[{i+1}/{len(tickers)}] {tk}: {len(tk_signals)} signals, "
+              f"{len(tk_failures)} verification failures", file=sys.stderr)
 
     print(f"\n{len(daily_by_ticker)}/{len(tickers)} tickers processed, "
-          f"{len(signals)} total signals, {len(skipped_tickers)} skipped: "
-          f"{skipped_tickers}", file=sys.stderr)
+          f"{len(signals)} total signals, {len(all_failures)} verification failures "
+          f"(unverifiable weekly-implied triggers, skipped rather than fabricated), "
+          f"{len(skipped_tickers)} tickers skipped: {skipped_tickers}", file=sys.stderr)
 
     close_matrix = build_close_matrix(daily_by_ticker)
-    daily_df, trades_df, skipped_df = simulate_portfolio(signals, close_matrix)
+    daily_df, trades_df, skipped_df, open_positions_df = simulate_portfolio(signals, close_matrix)
+    failures_df = pd.DataFrame(all_failures)
+
+    # [AUDIT FIX #1] Explicit reconciliation using BOTH completed trades
+    # AND still-open positions -- see reconcile_ledger()'s own docstring.
+    reconciliation = reconcile_ledger(START_CAPITAL, trades_df, open_positions_df, daily_df)
     # Full, UNFILTERED strategy performance across its whole available
     # history (some tickers go back to 1970) -- kept as supplementary
     # context, same convention as Milestone A's "preserve the unfiltered
@@ -810,37 +1152,73 @@ def run_real_universe(tickers: list):
         final_equity_rescaled_100k = daily_window["equity"].iloc[-1] * rescale
         print(f"\nSPY-comparable window (both sides, identical dates): "
               f"{common_start.date()} to {common_end.date()}", file=sys.stderr)
+
+        # [AUDIT FIX #5] A pure linear rescale of the realized 1970-start
+        # equity path (above) is NOT the same thing as actually restarting
+        # the simulation with START_CAPITAL cash and NO prior open
+        # positions on SPY's real inception date -- real position-sizing
+        # and skip decisions (max_positions, insufficient_cash) genuinely
+        # differ with a smaller, freshly-starting capital base, so the
+        # audit explicitly asked for this as a SEPARATE, independent run,
+        # reported alongside (not instead of) the illustrative rescale.
+        signals_from_spy = [s for s in signals if s["entry_date"] >= common_start]
+        close_matrix_from_spy = close_matrix.loc[close_matrix.index >= common_start]
+        (daily_df_i, trades_df_i, skipped_df_i,
+         open_positions_df_i) = simulate_portfolio(signals_from_spy, close_matrix_from_spy)
+        metrics_independent = compute_metrics(daily_df_i, trades_df_i, START_CAPITAL)
+        print(f"Independent re-simulation from SPY inception ({common_start.date()}), "
+              f"fresh ${START_CAPITAL:,.0f} start, no carried-over positions: "
+              f"{len(trades_df_i)} trades, final equity "
+              f"${metrics_independent.get('final_equity', float('nan')):,.2f}", file=sys.stderr)
     else:
         print("SPY fetch failed -- no benchmark comparison possible", file=sys.stderr)
         metrics_window, spy_metrics, final_equity_rescaled_100k = {}, {}, np.nan
+        metrics_independent = {}
 
     trades_df.to_csv("milestone_b_trades.csv", index=False)
     daily_out.to_csv("milestone_b_daily_equity.csv")
     if len(skipped_df):
         skipped_df.to_csv("milestone_b_skipped_signals.csv", index=False)
+    open_positions_df.to_csv("milestone_b_open_positions.csv", index=False)
+    if len(failures_df):
+        failures_df.to_csv("milestone_b_verification_failures.csv", index=False)
+    pd.DataFrame([reconciliation]).to_csv("milestone_b_reconciliation.csv", index=False)
 
     all_keys = list(metrics_full.keys())
     summary_rows = [{"metric": k, "strategy_full_history": metrics_full.get(k, np.nan),
                       "strategy_vs_spy_window": metrics_window.get(k, np.nan),
-                      "spy_buy_and_hold_same_window": spy_metrics.get(k, np.nan)}
+                      "spy_buy_and_hold_same_window": spy_metrics.get(k, np.nan),
+                      "strategy_independent_100k_from_spy_inception": metrics_independent.get(k, np.nan)}
                      for k in all_keys]
     summary_rows.append({"metric": "final_equity_rescaled_to_100k_start (illustrative only)",
                           "strategy_full_history": np.nan,
                           "strategy_vs_spy_window": final_equity_rescaled_100k,
-                          "spy_buy_and_hold_same_window": spy_metrics.get("final_equity", np.nan)})
+                          "spy_buy_and_hold_same_window": spy_metrics.get("final_equity", np.nan),
+                          "strategy_independent_100k_from_spy_inception": np.nan})
     summary_df = pd.DataFrame(summary_rows)
     summary_df.to_csv("milestone_b_summary.csv", index=False)
 
     pd.set_option("display.width", 160)
     print("\n=== MILESTONE B: STRATEGY FULL HISTORY, AND STRATEGY vs SPY (SAME WINDOW) ===")
     print(summary_df.to_string(index=False))
+    print("\n=== RECONCILIATION (completed trades + still-open positions vs simulator's own cash/equity) ===")
+    print(pd.Series(reconciliation).to_string())
     print(f"\nSaved: milestone_b_trades.csv ({len(trades_df)} rows)")
     print(f"Saved: milestone_b_daily_equity.csv ({len(daily_out)} rows)")
     if len(skipped_df):
         print(f"Saved: milestone_b_skipped_signals.csv ({len(skipped_df)} rows) "
               f"-- {skipped_df['skip_reason'].value_counts().to_dict()}")
+    print(f"Saved: milestone_b_open_positions.csv ({len(open_positions_df)} rows)")
+    if len(failures_df):
+        print(f"Saved: milestone_b_verification_failures.csv ({len(failures_df)} rows) "
+              f"-- {failures_df['kind'].value_counts().to_dict()}")
+    else:
+        print("No verification failures on this run (every weekly-implied trigger was "
+              "confirmed by real daily bars) -- milestone_b_verification_failures.csv not written")
+    print("Saved: milestone_b_reconciliation.csv")
     print("Saved: milestone_b_summary.csv")
-    return daily_df, trades_df, skipped_df, metrics_full, metrics_window, spy_metrics
+    return (daily_df, trades_df, skipped_df, open_positions_df, failures_df,
+            reconciliation, metrics_full, metrics_window, spy_metrics, metrics_independent)
 
 
 # --------------------------------------------------------------------------
@@ -864,6 +1242,8 @@ def main():
     test_position_limit_enforced()
     print("Running no-duplicate-ticker-position test...\n")
     test_no_duplicate_ticker_position()
+    print("Running stop-before-tp-same-week-conflict test...\n")
+    test_stop_before_tp_same_week_conflict()
 
     if args.synthetic:
         return
