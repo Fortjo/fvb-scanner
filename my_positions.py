@@ -81,6 +81,32 @@ def load_account_state():
         return None
 
 
+def _mark_position_usd(row) -> tuple[float, bool]:
+    """Current USD value of one open-position row (entry_price,
+    position_size columns), marked at today's close. Returns
+    (value_usd, counted) — counted is False if the row couldn't be
+    parsed at all (so the caller can skip it from open_count too),
+    True otherwise even when the price fetch itself failed, since the
+    position still falls back to its own USD cost basis and still
+    counts as an open slot."""
+    try:
+        entry_price = float(row["entry_price"])
+        position_size = float(row["position_size"])
+    except (ValueError, TypeError):
+        return 0.0, False
+    mark_usd = position_size  # fallback: USD cost basis
+    try:
+        raw = bt.fetch(row["ticker"].strip())
+        if raw is not None:
+            df = bt.prep(raw)
+            if len(df) > 0:
+                current_price = df["Close"].values[-1]
+                mark_usd = position_size * (current_price / entry_price)
+    except Exception:
+        pass
+    return mark_usd, True
+
+
 def compute_account_summary():
     """Returns None if account_state.csv doesn't exist yet (sizing section
     is simply skipped from the email in that case — same pattern as the
@@ -88,6 +114,17 @@ def compute_account_summary():
     EUR:
         cash, slots, open_count, equity, per_slot_eur,
         available_slots, suggested_buy_eur, fx_rate, fx_live
+
+    One real brokerage account funds BOTH the main book (my_positions.csv)
+    and the small-cap book (small_cap_positions.csv), sharing the same
+    cash and the same slot count — so this counts open positions from
+    both files, not just the main one, otherwise the small-cap scan's
+    account box (which calls this same function) would under-report
+    equity and over-report free slots the moment any small-cap position
+    is actually opened. Imports small_cap_positions lazily (inside the
+    function, not at module load) since that module imports this one —
+    a top-level import here would be circular.
+
     Open positions are marked at TODAY'S USD price (not entry price) to
     get a real current equity figure, same price fetch
     build_positions_section() already does, then converted to EUR via
@@ -103,26 +140,22 @@ def compute_account_summary():
 
     equity = state["cash"]  # EUR
     open_count = 0
-    open_df = load_open_positions()
-    if open_df is not None and len(open_df) > 0:
+
+    open_dfs = [load_open_positions()]
+    try:
+        import small_cap_positions
+        open_dfs.append(small_cap_positions.load_open_positions())
+    except ImportError:
+        pass  # standalone use without that module present — main book only
+
+    for open_df in open_dfs:
+        if open_df is None or len(open_df) == 0:
+            continue
         for _, row in open_df.iterrows():
-            tk = row["ticker"].strip()
-            try:
-                entry_price = float(row["entry_price"])
-                position_size = float(row["position_size"])
-            except (ValueError, TypeError):
+            mark_usd, counted = _mark_position_usd(row)
+            if not counted:
                 continue
             open_count += 1
-            mark_usd = position_size  # fallback: USD cost basis
-            try:
-                raw = bt.fetch(tk)
-                if raw is not None:
-                    df = bt.prep(raw)
-                    if len(df) > 0:
-                        current_price = df["Close"].values[-1]
-                        mark_usd = position_size * (current_price / entry_price)
-            except Exception:
-                pass
             equity += mark_usd / fx_rate  # USD -> EUR
 
     slots = state["slots"]
