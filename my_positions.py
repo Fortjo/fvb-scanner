@@ -231,15 +231,22 @@ def _historical_avg_hold(ticker: str) -> float:
     return float(np.mean([t["hold"] for t in trades]))
 
 
-def build_positions_section():
-    open_df = load_open_positions()
+def build_positions_section(open_df=None, *, positions_file: str = None, section_title: str = "YOUR POSITIONS"):
+    """`open_df`/`positions_file` let a second book (e.g. the small-cap
+    scan's small_cap_positions.csv) reuse this exact logic instead of
+    duplicating it — pass the already-loaded dataframe and the filename
+    to mention in the not-found message. Defaults keep the main book's
+    original behavior unchanged."""
     if open_df is None:
-        return f"\n(No {POSITIONS_FILE} found — skipping your positions section. " \
+        open_df = load_open_positions()
+        positions_file = positions_file or POSITIONS_FILE
+    if open_df is None:
+        return f"\n(No {positions_file or POSITIONS_FILE} found — skipping your positions section. " \
                f"Upload it to the repo to enable this.)\n"
     if len(open_df) == 0:
-        return "\n=== YOUR POSITIONS ===\n\nNo open positions currently tracked.\n"
+        return f"\n=== {section_title} ===\n\nNo open positions currently tracked.\n"
 
-    lines = ["\n=== YOUR POSITIONS ===\n"]
+    lines = [f"\n=== {section_title} ===\n"]
     alerts = []
 
     for _, row in open_df.iterrows():
@@ -321,13 +328,15 @@ def build_positions_section():
     return "\n".join(lines)
 
 
-def build_closed_positions_section():
-    """Summarize realized P&L for every closed trade, plus running totals."""
-    closed_df = load_closed_positions()
+def build_closed_positions_section(closed_df=None, *, section_title: str = "CLOSED TRADES"):
+    """Summarize realized P&L for every closed trade, plus running totals.
+    `closed_df` lets a second book reuse this logic — see build_positions_section()."""
+    if closed_df is None:
+        closed_df = load_closed_positions()
     if closed_df is None or len(closed_df) == 0:
-        return "\n=== CLOSED TRADES ===\n\nNo closed trades yet.\n"
+        return f"\n=== {section_title} ===\n\nNo closed trades yet.\n"
 
-    lines = ["\n=== CLOSED TRADES ===\n"]
+    lines = [f"\n=== {section_title} ===\n"]
     total_dollar_pl = 0.0
     wins = 0
     losses = 0
@@ -377,15 +386,18 @@ def build_closed_positions_section():
     return "\n".join(lines)
 
 
-def build_positions_section_html():
+def build_positions_section_html(open_df=None, *, positions_file: str = None, section_title: str = "Your Positions"):
     """HTML version of build_positions_section() — same data, color-coded
     by FVB state (green/red) and P&L (green/red text), with alerts and
-    the stale-position note highlighted in amber."""
-    open_df = load_open_positions()
+    the stale-position note highlighted in amber. `open_df`/`positions_file`
+    let a second book reuse this logic — see build_positions_section()."""
     if open_df is None:
-        return "<p>(No my_positions.csv found — skipping your positions section.)</p>"
+        open_df = load_open_positions()
+        positions_file = positions_file or POSITIONS_FILE
+    if open_df is None:
+        return f"<p>(No {positions_file or POSITIONS_FILE} found — skipping your positions section.)</p>"
     if len(open_df) == 0:
-        return "<h2>Your Positions</h2><p>No open positions currently tracked.</p>"
+        return f"<h2>{section_title}</h2><p>No open positions currently tracked.</p>"
 
     rows_html = []
     alerts = []
@@ -477,7 +489,7 @@ def build_positions_section_html():
         </div>"""
 
     table = f"""
-    <h2 style="margin-top:30px;">Your Positions</h2>
+    <h2 style="margin-top:30px;">{section_title}</h2>
     {alert_html}
     <table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:14px;">
       <tr style="background-color:#333;color:white;">
@@ -493,11 +505,13 @@ def build_positions_section_html():
     return table
 
 
-def build_closed_positions_section_html():
-    """HTML version of build_closed_positions_section()."""
-    closed_df = load_closed_positions()
+def build_closed_positions_section_html(closed_df=None, *, section_title: str = "Closed Trades"):
+    """HTML version of build_closed_positions_section(). `closed_df` lets
+    a second book reuse this logic — see build_positions_section()."""
+    if closed_df is None:
+        closed_df = load_closed_positions()
     if closed_df is None or len(closed_df) == 0:
-        return "<h2>Closed Trades</h2><p>No closed trades yet.</p>"
+        return f"<h2>{section_title}</h2><p>No closed trades yet.</p>"
 
     rows_html = []
     total_dollar_pl = 0.0
@@ -547,7 +561,7 @@ def build_closed_positions_section_html():
     total_color = "#1a7a1a" if total_dollar_pl >= 0 else "#c0392b"
 
     table = f"""
-    <h2 style="margin-top:30px;">Closed Trades</h2>
+    <h2 style="margin-top:30px;">{section_title}</h2>
     <table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:14px;">
       <tr style="background-color:#333;color:white;">
         <th style="padding:8px;text-align:left;">Ticker</th>
