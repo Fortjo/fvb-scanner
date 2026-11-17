@@ -171,6 +171,24 @@ def scan_ticker(tk: str, fresh_weeks: int):
             rr = pct_to_tp / pct_to_risk
         else:
             rr = np.nan
+        # [ENTRY STRENGTH — see backtest_33fvb.CLOSE_POSITION_MIN_FILTER] where
+        # the ENTRY BAR ITSELF closed within its own weekly range: 1.0 closed
+        # at that week's high (strong), 0.0 at that week's low (weak). On
+        # 1,039 real trades this predicted a clean, large, out-of-sample-
+        # validated quality gap (+6.4%/trade bottom quartile vs +12.5%/trade
+        # top quartile), and in the full portfolio simulation, only taking
+        # entries at/above the 0.4 cutoff improved CAGR, Sharpe and drawdown
+        # on both the train AND test (2023+) segments. Shown here as a tag,
+        # not a silent filter — the scan still reports every signal; this
+        # just flags which ones historically tend to be the better half.
+        entry_range = hgh[entry_i] - lw[entry_i]
+        close_position = ((cl[entry_i] - lw[entry_i]) / entry_range) if entry_range > 0 else np.nan
+        if np.isnan(close_position):
+            entry_strength = "N/A"
+        elif close_position >= bt.CLOSE_POSITION_MIN_THRESHOLD:
+            entry_strength = "STRONG"
+        else:
+            entry_strength = "WEAK"
         result.update({
             "entry_date": idx[entry_i].strftime("%Y-%m-%d"),
             "entry_price": entry_px,
@@ -181,6 +199,8 @@ def scan_ticker(tk: str, fresh_weeks: int):
             "pct_to_risk": pct_to_risk,
             "risk_reward": rr,
             "below_stop_level": below_stop_level,
+            "close_position": close_position,
+            "entry_strength": entry_strength,
         })
     else:
         band_now = upperR[last_i] if has_real else basis[last_i] + frac * halfw[last_i]
@@ -217,7 +237,8 @@ def main():
             print(f"\n-- FRESH entries (opened within last {args.fresh_weeks} weeks), sorted by track record --")
             print(fresh[["ticker", "entry_date", "open_pl_pct", "weeks_held",
                          "hist_trades", "hist_win_rate", "hist_expectancy", "rating",
-                         "pct_to_tp", "pct_to_risk", "risk_reward"]].round(1).to_string(index=False))
+                         "pct_to_tp", "pct_to_risk", "risk_reward",
+                         "close_position", "entry_strength"]].round(2).to_string(index=False))
             print("\n  pct_to_tp/pct_to_risk are measured from CURRENT price, not the original entry —")
             print("  a low risk_reward here means most of the move toward the exit has already happened,")
             print("  even if the trade is still fresh by time held.")
