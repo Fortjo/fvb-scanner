@@ -42,7 +42,9 @@ Needs network (yfinance) -- run on a machine with real network access.
 Usage:
     python3 test_entry_confirmation.py milestone_c_sp500_baseline_trades.csv
 """
+from __future__ import annotations
 import sys
+from typing import Optional
 import numpy as np
 import pandas as pd
 from test_stochrsi_filter import bucket_stats
@@ -51,7 +53,7 @@ from test_stochrsi_variants import entry_week_index
 START = "1970-01-01"
 
 
-def fetch_ohlcv(ticker: str) -> pd.DataFrame | None:
+def fetch_ohlcv(ticker: str) -> Optional[pd.DataFrame]:
     """Same as backtest_33fvb.fetch(), but keeps Volume."""
     import yfinance as yf
     df = yf.download(ticker, start=START, interval="1wk",
