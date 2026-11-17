@@ -90,6 +90,34 @@ OVERSOLD_STOCH_LEN       = 14
 OVERSOLD_K_SMOOTH        = 3
 OVERSOLD_D_SMOOTH        = 3
 
+# [EXPERIMENT — 2026-11-17, not part of the validated baseline] optional
+# "require strong rejection" entry filter. StochRSI (above) came up empty
+# in every framing tried (require oversold-turning-up: rejected; avoid-
+# if-oversold: held on 1,039 real trades + out-of-sample, but hurt total
+# return once tested on the real per-ticker scan since it only ever
+# removes still-profitable trades with nothing to reallocate to).
+# close_position asks a different question: of the entry bar's own
+# weekly range, how close to the HIGH did it close (1.0 = closed at the
+# week's high, 0.0 = closed at the week's low)? On 1,039 real trades this
+# showed a clean, large, monotonic quartile trend (+6.4%/trade bottom
+# quartile -> +12.5%/trade top quartile) that HELD on a genuine 2023+
+# out-of-sample split (and widened, not shrank, out-of-sample: below-
+# cutoff trades were flat at -0.15% exp, above-cutoff stayed at +8.4%).
+# Caveat: yearly breakdown is close to a coin flip (above beat below in
+# only 30/52 years) -- real in aggregate and out-of-sample, but not a
+# signal that wins every year. Off by default; turn on with
+# --close-position-min-filter and compare via milestone_c_vol_sizing.py's
+# full portfolio-level comparison, not just this file's per-trade stats,
+# since (like the StochRSI filter above) any "skip this entry" filter
+# mechanically lowers total return in this per-ticker, uncapped-capital
+# scan — the only honest test is whether it helps when capital is
+# limited and skipped slots can go to a stronger signal instead.
+CLOSE_POSITION_MIN_FILTER    = False
+CLOSE_POSITION_MIN_THRESHOLD = 0.4   # entry bar's close must be in the
+                                      # top (1 - threshold) of its own
+                                      # weekly range (validated train-
+                                      # median cutoff was 0.376)
+
 # Your validated 82-ticker universe (momentum + blue-chip), from the BX+FVB testing.
 MOMENTUM_TICKERS = [
     "ENPH", "LUNR", "FCX", "DOCN", "BAND", "HIMS", "INOD", "IVZ", "KALU",
@@ -452,7 +480,9 @@ def prep(df: pd.DataFrame) -> pd.DataFrame:
 # BACKTEST one ticker / one config
 # --------------------------------------------------------------------------
 def run(df: pd.DataFrame, band: str, exit_mode: str,
-        oversold_avoid_filter: bool = OVERSOLD_AVOID_FILTER) -> list[dict]:
+        oversold_avoid_filter: bool = OVERSOLD_AVOID_FILTER,
+        close_position_min_filter: bool = CLOSE_POSITION_MIN_FILTER,
+        close_position_min_threshold: float = CLOSE_POSITION_MIN_THRESHOLD) -> list[dict]:
     frac = BAND_FRACS[band]
     trades = []
     in_pos, entry_px, entry_i, entry_tp_target = False, np.nan, -1, np.nan
@@ -520,9 +550,20 @@ def run(df: pd.DataFrame, band: str, exit_mode: str,
         if oversold_avoid_filter:
             k_here = stoch_k_lagged[i]
             oversold_ok = np.isnan(k_here) or k_here >= OVERSOLD_AVOID_THRESHOLD
+        # [EXPERIMENT] see CLOSE_POSITION_MIN_FILTER's comment above. Uses
+        # the entry bar's OWN high/low/close -- not lookahead, since the
+        # core entry rule below already decides off this same bar's own
+        # price action. A degenerate zero-range bar (high == low) can't
+        # be judged either way, so it's treated as "not blocking" (True),
+        # same conservative convention as the StochRSI NaN case above.
+        close_position_ok = True
+        if close_position_min_filter:
+            bar_range = hgh[i] - lw[i]
+            if bar_range > 0:
+                close_position_ok = (cl[i] - lw[i]) / bar_range >= close_position_min_threshold
         if (not in_pos) and green[i] == True and not np.isnan(band_px) \
                 and lw[i] <= band_px and i > 0 and not np.isnan(prior_band_px) \
-                and cl[i - 1] > prior_band_px and oversold_ok:      # noqa: E712
+                and cl[i - 1] > prior_band_px and oversold_ok and close_position_ok:      # noqa: E712
             entry_px = min(o[i], band_px)                       # [A5]
             entry_i, in_pos = i, True
             # [TP FIX — July 2026] prev_hh (200-week rolling high) can lock
@@ -596,6 +637,14 @@ def main():
                      help="[EXPERIMENT] skip an entry when weekly StochRSI %%K (last fully "
                           "completed week, no lookahead) is below OVERSOLD_AVOID_THRESHOLD "
                           "(default 20). Off by default.")
+    ap.add_argument("--close-position-min-filter", action="store_true",
+                     help="[EXPERIMENT] require the entry bar's own close to be in the top "
+                          "(1 - CLOSE_POSITION_MIN_THRESHOLD) of its own weekly range (default "
+                          "threshold 0.4). Off by default.")
+    ap.add_argument("--close-position-min-threshold", type=float,
+                     default=CLOSE_POSITION_MIN_THRESHOLD,
+                     help=f"threshold for --close-position-min-filter (default "
+                          f"{CLOSE_POSITION_MIN_THRESHOLD}).")
     args = ap.parse_args()
 
     tickers = args.tickers.split(",") if args.tickers else UNIVERSE
@@ -615,7 +664,9 @@ def main():
             continue
         for band in BAND_FRACS:
             for ex in ["NBarHigh", "SwingHigh"]:
-                trs = run(df, band, ex, oversold_avoid_filter=args.oversold_avoid_filter)
+                trs = run(df, band, ex, oversold_avoid_filter=args.oversold_avoid_filter,
+                          close_position_min_filter=args.close_position_min_filter,
+                          close_position_min_threshold=args.close_position_min_threshold)
                 segs = [("all", trs)]
                 if args.split and args.split.lower() != "none":
                     sd = pd.Timestamp(args.split)
