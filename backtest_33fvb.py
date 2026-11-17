@@ -560,6 +560,11 @@ def main():
         print(f"{tk}: done", file=sys.stderr)
 
     per = pd.DataFrame(rows)
+    if per.empty:
+        print("\nNo data came back for any ticker — check network/ticker symbols "
+              "(see stderr above for per-ticker fetch errors). Nothing to summarize.",
+              file=sys.stderr)
+        return
     per.to_csv("results_per_ticker.csv", index=False)
 
     agg = (per.groupby(["band", "exit", "segment"])
