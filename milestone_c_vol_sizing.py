@@ -170,6 +170,19 @@ VOL_TARGET_ANNUAL = 0.20
 VOL_MULT_MIN = 0.30
 VOL_MULT_MAX = 1.00
 
+# [EXPERIMENT -- 2026-11-17] optional close-position-min entry filter,
+# identical gating logic to backtest_33fvb.run()'s own
+# CLOSE_POSITION_MIN_FILTER (see its comment there for the validation
+# history: real, large, monotonic effect on 1,039 real trades, held
+# out-of-sample, but mechanically can only ever REMOVE trades in an
+# uncapped-capital per-ticker scan). This engine is where it can
+# actually be judged fairly: capital and slots are limited here, so
+# skipping a weak entry can free a slot for a stronger one instead of
+# just reducing total trades. Off by default; reuses backtest_33fvb's
+# own constant as the single source of truth for the threshold.
+CLOSE_POSITION_MIN_FILTER = False
+CLOSE_POSITION_MIN_THRESHOLD = bt.CLOSE_POSITION_MIN_THRESHOLD
+
 
 def vol_sizing_multiplier(recent_equity: list, lookback: int = VOL_LOOKBACK_DAYS,
                            target_vol: float = VOL_TARGET_ANNUAL,
@@ -198,9 +211,13 @@ class _TickerState:
     joint event-driven walk. One instance per ticker, mutated in place by
     run_corrected_portfolio() as weeks are processed."""
 
-    def __init__(self, ticker: str, df_weekly: pd.DataFrame, df_daily: pd.DataFrame):
+    def __init__(self, ticker: str, df_weekly: pd.DataFrame, df_daily: pd.DataFrame,
+                 close_position_min_filter: bool = CLOSE_POSITION_MIN_FILTER,
+                 close_position_min_threshold: float = CLOSE_POSITION_MIN_THRESHOLD):
         self.ticker = ticker
         self.dfd = df_daily
+        self.close_position_min_filter = close_position_min_filter
+        self.close_position_min_threshold = close_position_min_threshold
         self.exec_dates = mae._exec_dates(df_weekly.index, df_daily.index)
         self.n = len(df_weekly)
         self.idx = df_weekly.index
@@ -278,8 +295,17 @@ class _TickerState:
         band_px = self.upperR[i] if BAND == "High" else (self.lowerB[i] if BAND == "Low" else self.basis[i])
         prior_band_px = (self.upperR[i - 1] if BAND == "High" else
                          (self.lowerB[i - 1] if BAND == "Low" else self.basis[i - 1])) if i > 0 else np.nan
+        close_position_ok = True
+        if self.close_position_min_filter:
+            # same gating as backtest_33fvb.run(): judged on this bar's
+            # own weekly high/low/close, not lookahead -- a degenerate
+            # zero-range bar can't be judged either way, so it doesn't
+            # block (same conservative convention as the StochRSI filter).
+            bar_range = self.h[i] - self.l[i]
+            if bar_range > 0:
+                close_position_ok = (self.c[i] - self.l[i]) / bar_range >= self.close_position_min_threshold
         if not (self.green[i] == True and not np.isnan(band_px) and self.l[i] <= band_px and i > 0  # noqa: E712
-                and not np.isnan(prior_band_px) and self.c[i - 1] > prior_band_px):
+                and not np.isnan(prior_band_px) and self.c[i - 1] > prior_band_px and close_position_ok):
             return None
         sub = self.daily_window(i)
         if sub is None or len(sub) == 0:
@@ -310,7 +336,9 @@ class _TickerState:
 def run_corrected_portfolio(tickers_prepped: dict, start_capital: float = START_CAPITAL,
                              max_positions: int = MAX_POSITIONS, commission_bps: float = COMMISSION_BPS,
                              commission_min: float = COMMISSION_MIN, slippage_bps: float = SLIPPAGE_BPS,
-                             use_vol_sizing: bool = False):
+                             use_vol_sizing: bool = False,
+                             close_position_min_filter: bool = CLOSE_POSITION_MIN_FILTER,
+                             close_position_min_threshold: float = CLOSE_POSITION_MIN_THRESHOLD):
     """The joint, event-driven, bug-fixed engine. tickers_prepped:
     {ticker: (df_weekly_prepped_via_prep_v3, df_daily)}. When
     use_vol_sizing is True, every accepted entry's budget is scaled by
@@ -320,7 +348,9 @@ def run_corrected_portfolio(tickers_prepped: dict, start_capital: float = START_
     B's original equal-weight sizing, just run through the corrected
     engine. Returns (daily_df, trades_df, skipped_df, open_positions_df,
     failures_df)."""
-    states = {tk: _TickerState(tk, w, d) for tk, (w, d) in tickers_prepped.items()}
+    states = {tk: _TickerState(tk, w, d, close_position_min_filter=close_position_min_filter,
+                                close_position_min_threshold=close_position_min_threshold)
+               for tk, (w, d) in tickers_prepped.items()}
     all_weeks = sorted(set().union(*(set(s.idx) for s in states.values()))) if states else []
 
     close_matrix = build_close_matrix({tk: d for tk, (w, d) in tickers_prepped.items()})
@@ -986,6 +1016,94 @@ def run_comparison(tickers: list, output_tag: str = ""):
 
 
 # --------------------------------------------------------------------------
+# REAL-DATA PIPELINE -- close-position-min filter, portfolio-level test.
+# --------------------------------------------------------------------------
+def run_close_position_comparison(tickers: list, threshold: float = CLOSE_POSITION_MIN_THRESHOLD,
+                                   output_tag: str = ""):
+    """Same corrected engine as run_comparison(), but compares BASELINE
+    (no entry filter) against the close-position-min filter turned ON --
+    both runs use equal-weight sizing (use_vol_sizing=False) for both,
+    so only the entry filter's own effect shows up, not conflated with
+    the vol-sizing candidate. This is the fair test for a filter that
+    can only ever remove trades in backtest_33fvb.py's own uncapped-
+    capital per-ticker scan: here capital and slots are limited, so a
+    skipped weak entry can free a slot for a stronger signal instead of
+    just reducing total trades."""
+    tickers_prepped = {}
+    skipped_tickers = []
+    for i, tk in enumerate(tickers):
+        try:
+            weekly = bt.fetch(tk)
+            daily = bt.fetch_daily(tk)
+        except Exception as e:
+            print(f"{tk}: fetch error {e}", file=sys.stderr)
+            skipped_tickers.append(tk)
+            continue
+        if weekly is None or daily is None or len(weekly) == 0 or len(daily) == 0:
+            print(f"{tk}: insufficient data", file=sys.stderr)
+            skipped_tickers.append(tk)
+            continue
+        try:
+            prepped, _monthly = mae.prep_v3(weekly, daily)
+        except Exception as e:
+            print(f"{tk}: prep_v3 error {e}", file=sys.stderr)
+            skipped_tickers.append(tk)
+            continue
+        if len(prepped) < bt.NBAR_LEN + 20:
+            print(f"{tk}: too short after warmup", file=sys.stderr)
+            skipped_tickers.append(tk)
+            continue
+        tickers_prepped[tk] = (prepped, daily)
+        print(f"[{i+1}/{len(tickers)}] {tk}: prepped ({len(prepped)} weekly bars)", file=sys.stderr)
+
+    print(f"\n{len(tickers_prepped)}/{len(tickers)} tickers processed, {len(skipped_tickers)} skipped: "
+          f"{skipped_tickers}", file=sys.stderr)
+
+    print("\nRunning BASELINE (corrected engine, no entry filter)...", file=sys.stderr)
+    base_daily, base_trades, base_skipped, base_open, base_failures = run_corrected_portfolio(
+        tickers_prepped, use_vol_sizing=False, close_position_min_filter=False)
+    base_recon = reconcile_ledger(START_CAPITAL, base_trades, base_open, base_daily)
+    base_metrics = compute_metrics(base_daily, base_trades, base_open, START_CAPITAL)
+
+    print(f"Running CLOSE-POSITION-MIN FILTER (threshold={threshold})...", file=sys.stderr)
+    cand_daily, cand_trades, cand_skipped, cand_open, cand_failures = run_corrected_portfolio(
+        tickers_prepped, use_vol_sizing=False, close_position_min_filter=True,
+        close_position_min_threshold=threshold)
+    cand_recon = reconcile_ledger(START_CAPITAL, cand_trades, cand_open, cand_daily)
+    cand_metrics = compute_metrics(cand_daily, cand_trades, cand_open, START_CAPITAL)
+
+    for label, prefix, daily_df, trades_df, skipped_df, open_df, failures_df in [
+        ("baseline", f"milestone_c{output_tag}_cpfilter_baseline", base_daily, base_trades, base_skipped, base_open, base_failures),
+        ("close_position_filter", f"milestone_c{output_tag}_cpfilter_candidate", cand_daily, cand_trades, cand_skipped, cand_open, cand_failures),
+    ]:
+        trades_df.to_csv(f"{prefix}_trades.csv", index=False)
+        daily_df.to_csv(f"{prefix}_daily_equity.csv")
+        if len(skipped_df):
+            skipped_df.to_csv(f"{prefix}_skipped_signals.csv", index=False)
+        open_df.to_csv(f"{prefix}_open_positions.csv", index=False)
+        if len(failures_df):
+            failures_df.to_csv(f"{prefix}_verification_failures.csv", index=False)
+        print(f"Saved {label}: {prefix}_trades.csv ({len(trades_df)} rows)", file=sys.stderr)
+
+    all_keys = list(base_metrics.keys())
+    comparison_rows = [{"metric": k, "baseline": base_metrics.get(k), "close_position_filter": cand_metrics.get(k)}
+                        for k in all_keys]
+    comparison_df = pd.DataFrame(comparison_rows)
+    comparison_path = f"milestone_c{output_tag}_cpfilter_comparison.csv"
+    comparison_df.to_csv(comparison_path, index=False)
+
+    pd.set_option("display.width", 160)
+    print(f"\n=== MILESTONE C{output_tag.upper()}: BASELINE vs CLOSE-POSITION-MIN FILTER (threshold={threshold}) ===")
+    print(comparison_df.to_string(index=False))
+    print(f"\nSaved: {comparison_path}")
+    print("\nRead this as: does limiting entries to strong-close bars help once capital/slots are "
+          "limited (CAGR, Sharpe, drawdown improve) or does it just mean fewer, still-unremarkable "
+          "trades (metrics flat or worse, trade_count down)? Compare trade_count too -- this filter "
+          "can only ever reduce it.")
+    return base_metrics, cand_metrics
+
+
+# --------------------------------------------------------------------------
 # MAIN
 # --------------------------------------------------------------------------
 def main():
@@ -1001,6 +1119,14 @@ def main():
                           "question (does this generalize beyond Peter's own universe?), not a "
                           "like-for-like rerun of the existing comparison. Output files get a "
                           "'_sp500' tag so they never overwrite the default-universe run's CSVs.")
+    ap.add_argument("--close-position-min-filter", action="store_true",
+                     help="[EXPERIMENT] instead of the baseline-vs-vol-sizing comparison, run "
+                          "baseline-vs-close-position-min-filter through the same corrected "
+                          "engine (both equal-weight sizing, isolating the entry filter's own "
+                          "effect). See CLOSE_POSITION_MIN_FILTER's comment above for the "
+                          "validation history.")
+    ap.add_argument("--close-position-min-threshold", type=float, default=CLOSE_POSITION_MIN_THRESHOLD,
+                     help=f"threshold for --close-position-min-filter (default {CLOSE_POSITION_MIN_THRESHOLD}).")
     args = ap.parse_args()
 
     print("Running vol-sizing-multiplier-formula test...\n")
@@ -1033,7 +1159,11 @@ def main():
         tickers = list(bt.UNIVERSE)
         output_tag = ""
 
-    run_comparison(tickers, output_tag=output_tag)
+    if args.close_position_min_filter:
+        run_close_position_comparison(tickers, threshold=args.close_position_min_threshold,
+                                       output_tag=output_tag)
+    else:
+        run_comparison(tickers, output_tag=output_tag)
 
 
 if __name__ == "__main__":
