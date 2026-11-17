@@ -1015,11 +1015,34 @@ def run_comparison(tickers: list, output_tag: str = ""):
     return base_metrics, cand_metrics, base_recon, cand_recon
 
 
+def segment_metrics(daily_df: pd.DataFrame, trades_df: pd.DataFrame, open_positions_df: pd.DataFrame,
+                     split_date: pd.Timestamp, before: bool) -> dict:
+    """compute_metrics() restricted to one side of a train/test split, so
+    a portfolio-level comparison can be checked out-of-sample the same
+    way every per-trade check in this project already was. Both the
+    equity curve AND the trade/open-position rows are cut at split_date
+    (trades/open positions by entry_date, matching every other OOS check
+    in this project), and drawdown/CAGR are computed FRESH within the
+    segment (cummax resets at the segment's own start, start_capital is
+    the segment's own first equity value) rather than inherited from the
+    other side -- i.e. "how did this filter do during just this
+    stretch," not "what fraction of the whole run's drawdown happened to
+    fall in this stretch.\""""
+    seg_daily = daily_df[daily_df.index < split_date] if before else daily_df[daily_df.index >= split_date]
+    if len(seg_daily) < 2:
+        return {}
+    seg_trades = trades_df[trades_df["entry_date"] < split_date] if before \
+        else trades_df[trades_df["entry_date"] >= split_date]
+    seg_open = open_positions_df[open_positions_df["entry_date"] < split_date] if before \
+        else open_positions_df[open_positions_df["entry_date"] >= split_date]
+    return compute_metrics(seg_daily, seg_trades, seg_open, start_capital=float(seg_daily["equity"].iloc[0]))
+
+
 # --------------------------------------------------------------------------
 # REAL-DATA PIPELINE -- close-position-min filter, portfolio-level test.
 # --------------------------------------------------------------------------
 def run_close_position_comparison(tickers: list, threshold: float = CLOSE_POSITION_MIN_THRESHOLD,
-                                   output_tag: str = ""):
+                                   output_tag: str = "", split: str = None):
     """Same corrected engine as run_comparison(), but compares BASELINE
     (no entry filter) against the close-position-min filter turned ON --
     both runs use equal-weight sizing (use_vol_sizing=False) for both,
@@ -1100,6 +1123,32 @@ def run_close_position_comparison(tickers: list, threshold: float = CLOSE_POSITI
           "limited (CAGR, Sharpe, drawdown improve) or does it just mean fewer, still-unremarkable "
           "trades (metrics flat or worse, trade_count down)? Compare trade_count too -- this filter "
           "can only ever reduce it.")
+
+    if split and split.lower() != "none":
+        split_date = pd.Timestamp(split)
+        print(f"\n=== OUT-OF-SAMPLE CHECK (split date: {split_date.date()}) ===")
+        print("Both the whole-run comparison above AND this split are the SAME two simulations "
+              "already run (one each for baseline/candidate) -- just the resulting equity curve and "
+              "trade log cut into a train and a test segment and re-scored fresh within each, the "
+              "same convention every other out-of-sample check in this project used.")
+        base_train = segment_metrics(base_daily, base_trades, base_open, split_date, before=True)
+        base_test = segment_metrics(base_daily, base_trades, base_open, split_date, before=False)
+        cand_train = segment_metrics(cand_daily, cand_trades, cand_open, split_date, before=True)
+        cand_test = segment_metrics(cand_daily, cand_trades, cand_open, split_date, before=False)
+        for label, b, c in [("TRAIN", base_train, cand_train), ("TEST (out-of-sample)", base_test, cand_test)]:
+            if not b or not c:
+                print(f"\n{label}: not enough data in this segment to score.")
+                continue
+            rows = [{"metric": k, "baseline": b.get(k), "close_position_filter": c.get(k)}
+                    for k in ["cagr_pct", "max_drawdown_pct", "sharpe", "sortino", "calmar",
+                              "win_rate_pct", "profit_factor", "trade_count"]]
+            print(f"\n--- {label} ---")
+            print(pd.DataFrame(rows).to_string(index=False))
+        print("\nRead this as: does the candidate still beat baseline on CAGR/Sharpe/drawdown within "
+              "TEST specifically (data this exact comparison never looked at before now), not just in "
+              "the whole-history number above -- the same bar every StochRSI/close-position result in "
+              "this project was held to before being trusted.")
+
     return base_metrics, cand_metrics
 
 
@@ -1127,6 +1176,10 @@ def main():
                           "validation history.")
     ap.add_argument("--close-position-min-threshold", type=float, default=CLOSE_POSITION_MIN_THRESHOLD,
                      help=f"threshold for --close-position-min-filter (default {CLOSE_POSITION_MIN_THRESHOLD}).")
+    ap.add_argument("--split", type=str, default="2023-01-01",
+                     help="with --close-position-min-filter: also score baseline/candidate separately "
+                          "on train (<) and test (>=) segments of the SAME run. Pass --split none to "
+                          "skip this and only see the whole-history comparison.")
     args = ap.parse_args()
 
     print("Running vol-sizing-multiplier-formula test...\n")
@@ -1161,7 +1214,7 @@ def main():
 
     if args.close_position_min_filter:
         run_close_position_comparison(tickers, threshold=args.close_position_min_threshold,
-                                       output_tag=output_tag)
+                                       output_tag=output_tag, split=args.split)
     else:
         run_comparison(tickers, output_tag=output_tag)
 
