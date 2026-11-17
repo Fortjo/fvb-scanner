@@ -68,6 +68,28 @@ STOP_DEF    = "basis_slope"  # [UPDATED] this stop just checks "not green" — a
 START       = "1970-01-01"  # was 2000 — missed 14 years of ORCL's actual 1986+ history vs
                             # what a TradingView chart with full history loaded would show
 
+# [EXPERIMENT — 2026-11-17, not part of the validated baseline] optional
+# "avoid oversold" entry filter. NOT the originally-tested hypothesis
+# (require StochRSI oversold-AND-turning-up at entry) -- that one was
+# tested and REJECTED on 1,039 real S&P500 trades (3 of 4 variants hurt
+# expectancy/PF; the one that looked good was a 56-trade sample that
+# flipped sign on a 1-week lag change, i.e. unstable). This is the
+# OPPOSITE framing that the same data actually supported: SKIP a signal
+# when weekly StochRSI %K is simply oversold, regardless of any cross.
+# That version held up across 5 thresholds x 2 lag choices in-sample AND
+# on a genuine 2023+ out-of-sample split (avoid-bucket win rate ~50-60%/
+# ~breakeven expectancy vs keep-bucket 62-74% win/+5.6-10.4% expectancy,
+# same direction at every threshold tried). Off by default so the
+# validated baseline is completely unaffected; turn on with
+# --oversold-avoid-filter to compare via milestone_c_vol_sizing.py's full
+# portfolio-level comparison, not just this file's per-trade stats.
+OVERSOLD_AVOID_FILTER    = False
+OVERSOLD_AVOID_THRESHOLD = 20     # weekly StochRSI %K cutoff
+OVERSOLD_RSI_LEN         = 14
+OVERSOLD_STOCH_LEN       = 14
+OVERSOLD_K_SMOOTH        = 3
+OVERSOLD_D_SMOOTH        = 3
+
 # Your validated 82-ticker universe (momentum + blue-chip), from the BX+FVB testing.
 MOMENTUM_TICKERS = [
     "ENPH", "LUNR", "FCX", "DOCN", "BAND", "HIMS", "INOD", "IVZ", "KALU",
@@ -272,6 +294,30 @@ def _compute_real_fvb(m: pd.DataFrame, length: int):
     return green, upper, lower
 
 
+def _compute_stoch_rsi(close: pd.Series):
+    """[EXPERIMENT] Standard StochRSI (Stochastic applied to RSI), same
+    formula and defaults as test_stochrsi_filter.py's compute_stoch_rsi()
+    -- duplicated here rather than imported, to keep this file's own
+    dependency graph self-contained (the test_* files import FROM this
+    module, so importing back would be circular). Wilder-style EWM RSI
+    approximation (alpha=1/14), not an exact port of any specific
+    charting platform. Returns (k, d) aligned to `close`'s index."""
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / OVERSOLD_RSI_LEN, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / OVERSOLD_RSI_LEN, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - 100 / (1 + rs)
+    rsi = rsi.where(avg_loss != 0, 100.0)
+    rsi_min = rsi.rolling(OVERSOLD_STOCH_LEN).min()
+    rsi_max = rsi.rolling(OVERSOLD_STOCH_LEN).max()
+    stoch = 100 * (rsi - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan)
+    k = stoch.rolling(OVERSOLD_K_SMOOTH).mean()
+    d = k.rolling(OVERSOLD_D_SMOOTH).mean()
+    return k, d
+
+
 def straddle_sample_size(m, length: int) -> int:
     """How many historical months actually feed the FVB band-width
     median right now. A small number here (confirmed on XEL: 51 months
@@ -394,12 +440,19 @@ def prep(df: pd.DataFrame) -> pd.DataFrame:
             conf[i + PIV_R] = h[i]        # value known at confirmation bar
     out["pivot_conf"] = conf
     out["prev_hh"] = df["High"].rolling(NBAR_LEN).max().shift(1)
+    # [EXPERIMENT] weekly StochRSI %K, shifted 1 bar so out["stoch_k_lagged"][i]
+    # reflects the LAST FULLY COMPLETED week's close (known before week i
+    # starts) -- same no-lookahead convention validated in
+    # test_stochrsi_avoid_filter.py (its "1wk-lag" reference point).
+    stoch_k, _ = _compute_stoch_rsi(df["Close"])
+    out["stoch_k_lagged"] = stoch_k.shift(1)
     return out.dropna(subset=["basis"])
 
 # --------------------------------------------------------------------------
 # BACKTEST one ticker / one config
 # --------------------------------------------------------------------------
-def run(df: pd.DataFrame, band: str, exit_mode: str) -> list[dict]:
+def run(df: pd.DataFrame, band: str, exit_mode: str,
+        oversold_avoid_filter: bool = OVERSOLD_AVOID_FILTER) -> list[dict]:
     frac = BAND_FRACS[band]
     trades = []
     in_pos, entry_px, entry_i, entry_tp_target = False, np.nan, -1, np.nan
@@ -410,6 +463,12 @@ def run(df: pd.DataFrame, band: str, exit_mode: str) -> list[dict]:
     upperR = df["upperR"].values if has_real_bands else None
     piv, prev_hh = df["pivot_conf"].values, df["prev_hh"].values
     idx = df.index
+    # [EXPERIMENT] see OVERSOLD_AVOID_FILTER's comment above. NaN (not yet
+    # enough weekly history for StochRSI) is treated as "not oversold" --
+    # i.e. doesn't block an otherwise-valid entry -- not as a pass, so an
+    # early-history false negative never masquerades as evidence for the
+    # filter.
+    stoch_k_lagged = df["stoch_k_lagged"].values if oversold_avoid_filter else None
     for i in range(len(df)):
         if has_real_bands:
             # [FULL TRANSPLANT] real, asymmetric bands: High = real upper
@@ -457,9 +516,13 @@ def run(df: pd.DataFrame, band: str, exit_mode: str) -> list[dict]:
                 prior_band_px = basis[i - 1] + frac * halfw[i - 1]
         else:
             prior_band_px = np.nan
+        oversold_ok = True
+        if oversold_avoid_filter:
+            k_here = stoch_k_lagged[i]
+            oversold_ok = np.isnan(k_here) or k_here >= OVERSOLD_AVOID_THRESHOLD
         if (not in_pos) and green[i] == True and not np.isnan(band_px) \
                 and lw[i] <= band_px and i > 0 and not np.isnan(prior_band_px) \
-                and cl[i - 1] > prior_band_px:                     # noqa: E712
+                and cl[i - 1] > prior_band_px and oversold_ok:      # noqa: E712
             entry_px = min(o[i], band_px)                       # [A5]
             entry_i, in_pos = i, True
             # [TP FIX — July 2026] prev_hh (200-week rolling high) can lock
@@ -529,6 +592,10 @@ def main():
                          "Default matches your prior BX+FVB validation split. "
                          "Pass --split none to disable.")
     ap.add_argument("--synthetic", action="store_true")
+    ap.add_argument("--oversold-avoid-filter", action="store_true",
+                     help="[EXPERIMENT] skip an entry when weekly StochRSI %%K (last fully "
+                          "completed week, no lookahead) is below OVERSOLD_AVOID_THRESHOLD "
+                          "(default 20). Off by default.")
     args = ap.parse_args()
 
     tickers = args.tickers.split(",") if args.tickers else UNIVERSE
@@ -548,7 +615,7 @@ def main():
             continue
         for band in BAND_FRACS:
             for ex in ["NBarHigh", "SwingHigh"]:
-                trs = run(df, band, ex)
+                trs = run(df, band, ex, oversold_avoid_filter=args.oversold_avoid_filter)
                 segs = [("all", trs)]
                 if args.split and args.split.lower() != "none":
                     sd = pd.Timestamp(args.split)

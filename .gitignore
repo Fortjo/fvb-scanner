@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# backtest_33fvb.py main() always regenerates these -- disposable run output,
+# never meant to be committed
+results_per_ticker.csv
+results_summary.csv
