@@ -94,6 +94,7 @@ def build_email_body(fresh_weeks: int = 12, regime_info: dict = None):
         lines.append("\nNo fresh buy signals this week.")
     else:
         for _, row in fresh.iterrows():
+            below_warn = " ** BELOW STOP LEVEL (close basis) — check chart **" if row.get("below_stop_level") else ""
             thin_warn = " ** THIN BAND SAMPLE — verify on TradingView Monthly chart before acting **" if row.get("thin_sample") else ""
             struct_tag = row.get("daily_structure", "INSUFFICIENT")
             struct_line = f"  Daily structure: {struct_tag}" if struct_tag != "INSUFFICIENT" else ""
@@ -106,7 +107,20 @@ def build_email_body(fresh_weeks: int = 12, regime_info: dict = None):
             dd_med, dd_worst = row.get("hist_median_dd"), row.get("hist_worst_dd")
             if pd.notna(dd_med):
                 lines.append(f"  Typical drawdown before resolving: {dd_med:.1f}% (worst {dd_worst:.1f}%)")
-            lines.append(f"  Risk/reward from here: {rr_str}{thin_warn}")
+            lines.append(f"  Risk/reward from here: {rr_str}{below_warn}{thin_warn}")
+            # [ENTRY STRENGTH] same close_position/entry_strength fields
+            # scan_current_buys.scan_ticker() already computes for every
+            # row (shared with the main scan) -- just wasn't being shown
+            # here before. See send_scan_email.py's comment for the
+            # validation history. Shown as a flag, never used to hide a
+            # signal — you still see every entry either way.
+            cp = row.get("close_position")
+            strength = row.get("entry_strength")
+            if strength == "STRONG":
+                lines.append(f"  Entry strength: STRONG close ({cp:.2f}) — the historically better half")
+            elif strength == "WEAK":
+                lines.append(f"  Entry strength: WEAK close ({cp:.2f}) — below the validated "
+                              f"{bt.CLOSE_POSITION_MIN_THRESHOLD} cutoff, historically the weaker half")
             if struct_line:
                 lines.append(struct_line)
             if acct is not None:
@@ -129,18 +143,30 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int, acct: dict = 
                            regime_info: dict = None) -> str:
     """HTML version of the fresh-signals section, plus the HTML small-cap
     position/closed-trade tables — same layout as send_scan_email.py's
-    build_email_body_html(), minus the below-stop column (small-cap scan
-    doesn't compute that flag) so the table isn't left with an always-empty
-    column."""
+    build_email_body_html(). scan_ticker() computes below_stop_level and
+    close_position/entry_strength for every row regardless of universe
+    (shared function), so both are shown here the same way as the main
+    scan's email now too."""
     rows_html = []
     for _, row in fresh.iterrows():
         rr = row["risk_reward"]
         rr_str = f"{rr:.1f}" if pd.notna(rr) else "n/a"
+        below_warn = ('<br><span style="color:#c0392b;font-weight:bold;">&#9888; BELOW STOP LEVEL '
+                      '(close basis) — check chart</span>') if row.get("below_stop_level") else ""
         thin_warn = ('<br><span style="color:#b8860b;font-weight:bold;">&#9888; THIN BAND SAMPLE — verify on TradingView Monthly chart</span>') if row.get("thin_sample") else ""
         struct_tag = row.get("daily_structure", "INSUFFICIENT")
         struct_colors = {"BULLISH": "#1e8449", "MIXED": "#7d7d00", "BEARISH": "#c0392b"}
         struct_html = (f'<br><span style="color:{struct_colors.get(struct_tag,"#555")};">'
                        f'Daily structure: {struct_tag}</span>') if struct_tag != "INSUFFICIENT" else ""
+        cp, strength = row.get("close_position"), row.get("entry_strength")
+        if strength == "STRONG":
+            strength_html = (f'<br><span style="color:#1e8449;font-weight:bold;">'
+                              f'&#10003; STRONG close ({cp:.2f})</span>')
+        elif strength == "WEAK":
+            strength_html = (f'<br><span style="color:#b8860b;font-weight:bold;">'
+                              f'&#9888; WEAK close ({cp:.2f}) — below {bt.CLOSE_POSITION_MIN_THRESHOLD} cutoff</span>')
+        else:
+            strength_html = ""
         pl_color = "#1a7a1a" if row["open_pl_pct"] >= 0 else "#c0392b"
         size_cell = ""
         if acct is not None:
@@ -161,7 +187,7 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int, acct: dict = 
           <td style="padding:8px;border-bottom:1px solid #ddd;">{row['hist_trades']:.0f} trades<br>
               <span style="color:#666;font-size:12px;">{row['hist_win_rate']:.1f}% win, {row['hist_expectancy']:+.1f}% exp.<br>
               {('Typical DD ' + format(row['hist_median_dd'], '.1f') + '% (worst ' + format(row['hist_worst_dd'], '.1f') + '%)') if pd.notna(row.get('hist_median_dd')) else ''}</span></td>
-          <td style="padding:8px;border-bottom:1px solid #ddd;">{rr_str}{thin_warn}{struct_html}</td>
+          <td style="padding:8px;border-bottom:1px solid #ddd;">{rr_str}{below_warn}{thin_warn}{struct_html}{strength_html}</td>
           {size_cell}
         </tr>""")
 
