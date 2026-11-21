@@ -23,6 +23,7 @@ import scan_current_buys as scb
 import backtest_33fvb as bt
 import my_positions
 import market_regime
+import fundamentals_check as fc
 
 
 def build_email_body(fresh_weeks: int = 12, regime_info: dict = None) -> str:
@@ -43,6 +44,15 @@ def build_email_body(fresh_weeks: int = 12, regime_info: dict = None) -> str:
     held_tickers = my_positions.get_open_tickers()
     longs = longs[~longs["ticker"].str.upper().isin(held_tickers)]
     fresh = longs[longs["fresh"]].sort_values("hist_expectancy", ascending=False)
+
+    # [FUNDAMENTALS CHECK] Peter's checklist criteria 2-4 (5yr revenue
+    # growth, 5yr profitability, assets >= debt), free via yfinance --
+    # see fundamentals_check.py's docstring. Only run on the fresh
+    # signals actually shown below, not the whole scanned universe.
+    fresh = fresh.copy()
+    fund_info = {tk: fc.fundamentals_tag(tk) for tk in fresh["ticker"]}
+    fresh["fund_rating"] = fresh["ticker"].map(lambda tk: fund_info[tk]["rating"])
+    fresh["fund_reason"] = fresh["ticker"].map(lambda tk: fund_info[tk]["reason"])
 
     # [POSITION SIZING] honor-system balance from account_state.csv — you
     # tell me a fill, I update cash there, and this suggests a $ amount
@@ -91,6 +101,13 @@ def build_email_body(fresh_weeks: int = 12, regime_info: dict = None) -> str:
                               f"{bt.CLOSE_POSITION_MIN_THRESHOLD} cutoff, historically the weaker half")
             if struct_line:
                 lines.append(struct_line)
+            # [FUNDAMENTALS] Peter's checklist 2-4 -- moat (5) is never
+            # checked here, that stays your own call.
+            fund_rating, fund_reason = row.get("fund_rating"), row.get("fund_reason")
+            if fund_rating and fund_rating != "N/A":
+                lines.append(f"  Fundamentals (Peter's checklist 2-4): {fund_rating} — {fund_reason}")
+            elif fund_rating == "N/A":
+                lines.append(f"  Fundamentals (Peter's checklist 2-4): N/A — {fund_reason}")
             if acct is not None:
                 if acct["available_slots"] > 0:
                     lines.append(f"  Suggested buy size: €{acct['suggested_buy_eur']:.2f} "
@@ -135,6 +152,15 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int, acct: dict = 
                               f'&#9888; WEAK close ({cp:.2f}) — below {bt.CLOSE_POSITION_MIN_THRESHOLD} cutoff</span>')
         else:
             strength_html = ""
+        fund_rating, fund_reason = row.get("fund_rating"), row.get("fund_reason")
+        fund_colors = {"PASS": "#1e8449", "MIXED": "#b8860b", "FAIL": "#c0392b"}
+        if fund_rating in fund_colors:
+            fund_html = (f'<br><span style="color:{fund_colors[fund_rating]};font-weight:bold;">'
+                         f'Fundamentals: {fund_rating} — {fund_reason}</span>')
+        elif fund_rating == "N/A":
+            fund_html = f'<br><span style="color:#888;">Fundamentals: N/A — {fund_reason}</span>'
+        else:
+            fund_html = ""
         pl_color = "#1a7a1a" if row["open_pl_pct"] >= 0 else "#c0392b"
         size_cell = ""
         if acct is not None:
@@ -155,7 +181,7 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int, acct: dict = 
           <td style="padding:8px;border-bottom:1px solid #ddd;">{row['hist_trades']:.0f} trades<br>
               <span style="color:#666;font-size:12px;">{row['hist_win_rate']:.1f}% win, {row['hist_expectancy']:+.1f}% exp.<br>
               {('Typical DD ' + format(row['hist_median_dd'], '.1f') + '% (worst ' + format(row['hist_worst_dd'], '.1f') + '%)') if pd.notna(row.get('hist_median_dd')) else ''}</span></td>
-          <td style="padding:8px;border-bottom:1px solid #ddd;">{rr_str}{below_warn}{thin_warn}{struct_html}{strength_html}</td>
+          <td style="padding:8px;border-bottom:1px solid #ddd;">{rr_str}{below_warn}{thin_warn}{struct_html}{strength_html}{fund_html}</td>
           {size_cell}
         </tr>""")
 
