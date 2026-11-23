@@ -1,0 +1,26 @@
+name: Ad-hoc Check (manual, one-off analysis scripts)
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: 'Python file to run (must already exist in the repo)'
+        required: true
+        default: 'check_spy_band_history.py'
+      arg:
+        description: 'Optional single argument to pass to the script'
+        required: false
+        default: ''
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy
+      - name: Run script
+        run: python "${{ inputs.script }}" ${{ inputs.arg }}
