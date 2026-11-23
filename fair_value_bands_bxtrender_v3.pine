@@ -1,0 +1,1324 @@
+//@version=6
+// Fair Value Bands + B-Xtrender Signals — v2
+// Changes in this version (based on the 10-year backtest findings):
+// - NEW: Strategy mode selector — "Classic (BX + FVB)" or "Weekly DON BX"
+//        DON BX mode: while in a bull cycle (monthly BX not dark red + weekly FVB green),
+//        enter when the weekly Donchian BX INCREASES, exit when it DECREASES (color ignored).
+// - NEW: Daily volatility filter — entries only allowed when the stock's average
+//        daily move over the past month is >= threshold (default 3%). The #1 edge found.
+// - CHANGED DEFAULTS: Partial TP = OFF, ATR trail = OFF, Weekly structure exit = OFF
+//        (all three reduced returns in testing; options kept for experimentation)
+// - Everything else preserved: excursion study, dashboard, re-entry, manual tracked entry,
+//        money backtest, crosses.
+indicator("Fair Value Bands + B-Xtrender Signals v3", overlay = true, max_labels_count = 500, max_lines_count = 500, max_boxes_count = 100, behind_chart = false)
+
+// ─────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────
+groupStyle = "Chart Style"
+i_chartStyle = input.string("Classic", "Label & band style", options = ["Classic", "Slim"], group = groupStyle, tooltip = "Classic: full text labels and visible Fair Value Bands, as before. Slim: bands hidden, labels become small colored dots only — a cleaner look inspired by minimal SMC-style indicators.")
+i_colorCandlesByPosition = input.bool(false, "Color candles by position (green=long, red=flat)", group = groupStyle, tooltip = "Overrides normal up/down candle colors — green while a position is open, red while flat. Works in either label style above.")
+i_slimDotSize = input.int(2, "Slim dot size (Slim style only)", minval = 1, maxval = 6, group = groupStyle, tooltip = "Pixel width of the small circle markers used in Slim style. Lower = smaller.")
+i_slimDotDistance = input.float(0.5, "Slim dot distance from candle (x ATR)", minval = 0.1, maxval = 3.0, step = 0.1, group = groupStyle, tooltip = "How far the Slim dots float from the candle, in multiples of ATR. Lower = closer.")
+
+groupApb = "Entry Timing"
+i_entryMode = input.string("Immediate", "Entry mode", options = ["Immediate", "AdaptivePB"], group = groupApb, tooltip = "Immediate: buy on signal, as before. AdaptivePB: wait for a pullback to THIS STOCK'S OWN historical average pullback depth (learned from its prior completed trades) before filling — validated out-of-sample to beat Immediate when combined with Classic+DON Trim. Falls back to Immediate until enough trade history exists, and chases at market if the pullback never comes within the expiry window (so it never fully misses a signal — just aims for a better price first).")
+i_apbMinSamples = input.int(3, "Min prior trades before adapting", group = groupApb, minval = 1, maxval = 20)
+i_apbExpiryWeeks = input.int(10, "Expiry weeks (fallback to market)", group = groupApb, minval = 1, maxval = 52)
+
+groupMode = "Strategy Mode"
+i_strategyMode = input.string("Classic + DON Trim", "Strategy mode", options = ["Classic (BX + FVB)", "Weekly DON BX", "Classic + DON Trim"], group = groupMode, tooltip = "Classic: enter when weekly FVB turns green + monthly BX not dark red. Weekly DON BX: inside a bull cycle, enter on weekly Donchian BX increase, exit on decrease (color ignored). Classic + DON Trim: same entries/exits as Classic, but takes a partial profit whenever DON BX starts falling while unrealized gain is above the trigger threshold — validated across 42 tickers to hold up better through time than plain Classic.")
+
+groupVol = "Volatility Filter (the edge)"
+i_useVolFilter = input.bool(false, "Require minimum daily volatility", group = groupVol, tooltip = "Only allow entries when the average absolute daily move over the lookback is at least the threshold. Validated finding: OFF outperformed on the combined 82-ticker universe once the regime filter and BX+FVB logic are doing their job — kept OFF by default.")
+i_volMinPct    = input.float(3.0, "Min avg daily move %", group = groupVol, minval = 0.1, step = 0.1)
+i_volLookback  = input.int(21, "Lookback (trading days)", group = groupVol, minval = 5, maxval = 120)
+
+groupRegime = "Market Regime Filter (SPY 200MA)"
+i_useRegime         = input.bool(true, "Only enter when market is risk-on", group = groupRegime, tooltip = "Blocks NEW entries when the index is below its 200-day SMA. Does not force exits — existing positions still follow their normal exit rules. Reduces bear-market exposure and drawdown at the cost of some upside.")
+i_regimeSymbol      = input.symbol("AMEX:SPY", "Index symbol", group = groupRegime)
+i_regimeMaLen       = input.int(200, "Daily SMA length", group = groupRegime, minval = 50, maxval = 400)
+i_regimeConfirmDays = input.int(3, "Confirmation days above MA", group = groupRegime, minval = 1, maxval = 20, tooltip = "Index must have closed above its MA for this many consecutive daily closes. Filters whipsaws right at the line with little cost.")
+
+groupSize = "Position Size Calculator (info only)"
+i_accountSize = input.float(1000, "Account size ($)", group = groupSize, minval = 100, step = 100)
+i_riskPct     = input.float(1.0, "Risk per trade (% of account)", group = groupSize, minval = 0.1, maxval = 10, step = 0.1, tooltip = "The dashboard shows how many shares to buy so that an adverse move of (ATR x multiplier) loses exactly this % of the account. Equalizes risk across volatile and calm names.")
+i_atrLenSize  = input.int(14, "Daily ATR length", group = groupSize, minval = 1)
+i_atrMultSize = input.float(2.0, "Risk unit (ATR multiplier)", group = groupSize, minval = 0.5, step = 0.5)
+
+groupFair1 = "Fair Value Basis & Bands"
+i_btCheck             = input.bool(false, "Highlight metric calculations", group = groupFair1, tooltip = "Enables lot based coloring and time/volume distribution counters, found in Data Window tab.")
+i_boost               = input.float(1, "Threshold band width", group = groupFair1, step = 0.10, minval = 0)
+i_bandBoost           = input.float(1, "Deviation band width", group = groupFair1, step = 0.10, minval = 0)
+i_anchorTf            = input.timeframe("1D", "VWAP anchor", group = groupFair1, tooltip = "Timeframe to which VWAP is anchored. Choose VWAP from fair value basis menu to activate.")
+i_sourceString        = input.string("OHLC4", "", options = ["OHLC4","Open","High","Low","Close","HL2","HLC3","HLCC4"], inline = "source", group = groupFair1)
+i_smoothingType       = input.string("SMA", "", options = ["SMA","EMA","HMA","RMA","WMA","VWMA","Median","VWAP"], inline = "source", group = groupFair1)
+i_length              = input.int(33, "", inline = "source", group = groupFair1, minval = 1)
+i_trendMode           = input.string("Cross", "", options = ["Cross","Direction"], inline = "sourcecross", group = groupFair1)
+i_thresholdUpString   = input.string("Low", "▲", options = ["OHLC4","Open","High","Low","Close","HL2","HLC3","HLCC4"], inline = "sourcecross", group = groupFair1)
+i_thresholdDownString = input.string("High", "▼", options = ["OHLC4","Open","High","Low","Close","HL2","HLC3","HLCC4"], inline = "sourcecross", group = groupFair1)
+
+groupCross = "Crosses"
+i_crossSrc1     = input.source(high,  "Cross", group = groupCross, inline = "ucross1")
+i_crossMethod1  = input.string("Above", "", options = ["Above","Below"], inline = "ucross1", group = groupCross)
+i_crossRef1     = input.string("Off", "", options = ["Off","+1","+2","+3","-1","-2","-3"], inline = "ucross1", group = groupCross)
+i_crossSrc2     = input.source(low,   "Cross", group = groupCross, inline = "ucross2")
+i_crossMethod2  = input.string("Below", "", options = ["Above","Below"], inline = "ucross2", group = groupCross)
+i_crossRef2     = input.string("Off", "", options = ["Off","+1","+2","+3","-1","-2","-3"], inline = "ucross2", group = groupCross)
+i_crossSrc3     = input.source(close, "Cross", group = groupCross, inline = "ucross3")
+i_crossMethod3  = input.string("Above", "", options = ["Above","Below"], inline = "ucross3", group = groupCross)
+i_crossRef3     = input.string("Off", "", options = ["Off","+1","+2","+3","-1","-2","-3"], inline = "ucross3", group = groupCross)
+i_crossSrc4     = input.source(close, "Cross", group = groupCross, inline = "ucross4")
+i_crossMethod4  = input.string("Above", "", options = ["Above","Below"], inline = "ucross4", group = groupCross)
+i_crossRef4     = input.string("Off", "", options = ["Off","+1","+2","+3","-1","-2","-3"], inline = "ucross4", group = groupCross)
+i_crossAboveCol = input.color(color.blue, "Above", group = groupCross, inline = "crosses")
+i_crossBelowCol = input.color(color.fuchsia, "Below", group = groupCross, inline = "crosses")
+
+groupVisual = "Visuals"
+i_upColorLine      = input.color(color.new(color.white, 50), "Fair value basis ▲ / ▼", group = groupVisual, inline = "line")
+i_downColorLine    = input.color(color.new(color.red, 50), "", group = groupVisual, inline = "line")
+i_upColorFill      = input.color(color.new(color.white, 97), "Threshold band ▲ / ▼", group = groupVisual, inline = "fill")
+i_downColorFill    = input.color(color.new(color.red, 97), "", group = groupVisual, inline = "fill")
+deviationBandColor = input.color(color.new(color.white, 95), "Deviation bands", group = groupVisual, inline = "dev")
+
+groupTable = "Table"
+tablePos           = input.string("Top right", "Table position", options = ["Top right","Bottom right","Bottom left","Top left"], group = groupTable)
+tableSize          = input.int(3, "Table size", maxval = 5, minval = 1, group = groupTable)
+i_showStrategyPane = input.bool(true, "Show strategy dashboard", group = groupTable)
+i_dashStyle        = input.string("Compact", "Dashboard style", options = ["Compact","Full"], group = groupTable, tooltip = "Compact: 4 rows, only what you need at a glance. Full: all stats including backtest tracker and excursion data.")
+
+groupBX  = "B-Xtrender (Monthly)"
+short_l1 = input.int(5,  "Short - L1", group = groupBX)
+short_l2 = input.int(20, "Short - L2", group = groupBX)
+short_l3 = input.int(5,  "Short - L3", group = groupBX)
+long_l1  = input.int(20, "Long - L1",  group = groupBX)
+long_l2  = input.int(5,  "Long - L2",  group = groupBX)
+
+groupDon  = "Donchian BX (Weekly)"
+i_donL1   = input.int(5,  "Short - L1", group = groupDon)
+i_donL2   = input.int(20, "Short - L2", group = groupDon)
+i_donL3   = input.int(5,  "Smoothing - L3", group = groupDon, tooltip = "RSI length. NOTE: for a direction-only rule this barely changes signals — use the two settings below to control flip frequency.")
+i_donSmooth       = input.int(3, "Extra EMA smoothing (1 = off)", group = groupDon, minval = 1, maxval = 20, tooltip = "EMA applied AFTER the RSI. This genuinely delays direction flips. 1 disables it, 3-5 filters one-week noise, higher = slower exits.")
+i_donConfirmWeeks = input.int(1, "Exit confirm weeks", group = groupDon, minval = 1, maxval = 4, tooltip = "Exit only after this many CONSECUTIVE falling weekly closes. 2 ignores single soft weeks inside a trend; entries still fire on the first rising week.")
+
+groupRules = "Rule Filters (Classic mode)"
+i_useBxRule  = input.bool(true, "Use BX rule",  group = groupRules)
+i_useFvbRule = input.bool(true, "Use FVB rule", group = groupRules)
+
+groupSig        = "Signal Settings"
+i_showBuyLabel  = input.bool(true, "Show BUY labels",  group = groupSig)
+i_showSellLabel = input.bool(true, "Show SELL labels", group = groupSig)
+i_buyCol        = input.color(color.new(color.lime, 0), "BUY label color",  group = groupSig)
+i_sellCol       = input.color(color.new(color.red,  0), "SELL label color", group = groupSig)
+
+groupEntry = "Tracked Entry Price"
+i_useManualTrackedEntry = input.bool(false, "Use manual tracked entry price", group = groupEntry, tooltip = "Uses your actual filled entry price for TP and ATR trail calculations. Money backtest still uses signal fills.")
+i_manualTrackedEntry    = input.float(0.0, "Tracked entry price", group = groupEntry, step = 0.01, minval = 0.0)
+
+groupRe = "Weekly Pullback Re-entry"
+i_enableReEntry    = input.bool(false, "Enable weekly pullback re-entry", group = groupRe, tooltip = "Fires once per pullback episode. Resets when price closes above the upper band again after a re-entry.")
+i_showReEntryLabel = input.bool(true, "Show RE-ENTRY labels", group = groupRe)
+i_reEntryCol       = input.color(color.new(color.teal, 0), "RE-ENTRY label color", group = groupRe)
+
+groupTP = "Partial Take Profit (backtest: hurts returns — default OFF)"
+i_enablePartialTP = input.bool(false, "Enable partial TP signals", group = groupTP, tooltip = "Every take-profit variant tested over 10 years reduced CAGR vs holding. Kept as an option only.")
+i_tpMode          = input.string("Percent", "TP mode", options = ["Percent","ATR","Band"], group = groupTP)
+i_tpStepPercent   = input.float(20.0, "TP step % (Percent mode)", group = groupTP, minval = 0.1, step = 0.1)
+i_tpAtrLen        = input.int(14, "ATR length (ATR mode)", group = groupTP, minval = 1)
+i_tpAtrMult       = input.float(1.5, "ATR multiplier per level (ATR mode)", group = groupTP, minval = 0.1, step = 0.1)
+i_tpSellPct1      = input.float(10.0, "TP1 sell % of original", group = groupTP, minval = 0.1, maxval = 100, step = 0.1)
+i_tpSellPct2      = input.float(15.0, "TP2 sell % of original", group = groupTP, minval = 0.1, maxval = 100, step = 0.1)
+i_tpSellPct3      = input.float(20.0, "TP3+ sell % of original", group = groupTP, minval = 0.1, maxval = 100, step = 0.1)
+i_showTPLabels    = input.bool(true, "Show partial TP labels", group = groupTP)
+i_tpLabelColor    = input.color(color.new(color.orange, 0), "TP label color", group = groupTP)
+
+groupTrim = "DON Trim (Classic + DON Trim mode — validated: helps)"
+i_trimTriggerPct = input.float(15.0, "Trim trigger — min unrealized gain %", group = groupTrim, minval = 0, tooltip = "Only trims if the trade is up at least this much when DON BX starts falling.")
+i_trimFraction   = input.float(30.0, "Trim fraction — % of position sold per event", group = groupTrim, minval = 1, maxval = 100)
+i_showTrimLabel  = input.bool(true, "Show TRIM labels", group = groupTrim)
+i_trimLabelColor = input.color(color.new(color.purple, 0), "TRIM label color", group = groupTrim)
+
+groupATR = "ATR Trail (backtest: hurts returns — default OFF)"
+i_enableATRTrail   = input.bool(false, "Enable ATR trailing stop", group = groupATR, tooltip = "Trailing stops of 10-20% roughly halved CAGR in testing and did not reduce drawdown. Kept as an option only.")
+i_atrTrailLen      = input.int(14, "ATR length", group = groupATR, minval = 1)
+i_atrTrailMult     = input.float(2.0, "ATR multiplier", group = groupATR, minval = 0.1, step = 0.1)
+i_atrTrailAfterTP1 = input.bool(true, "Start trailing only after TP1", group = groupATR)
+i_showATRTrailLine = input.bool(true, "Show ATR trail line", group = groupATR)
+i_atrTrailColor    = input.color(color.new(color.yellow, 0), "ATR trail color", group = groupATR)
+
+groupStruct = "Weekly Structure Exit (extra exits hurt in testing — default OFF)"
+i_enableStructureExit = input.bool(false, "Enable weekly structure exit", group = groupStruct)
+i_structureMode       = input.string("Basis + Prev Lows", "Structure mode", options = ["Basis + Prev Lows","Lower Band"], group = groupStruct)
+i_structureLookback   = input.int(2, "Previous weekly lows lookback", group = groupStruct, minval = 1, maxval = 10)
+
+groupExc = "Historical Excursion Study"
+i_enableExcursionBox = input.bool(false, "Show historical pullback / run-up box", group = groupExc)
+i_excMaxSamples      = input.int(300, "Max stored completed samples", group = groupExc, minval = 10, maxval = 2000)
+i_excUseMaxBars      = input.bool(true, "Use max bars cap", group = groupExc)
+i_excMaxBars         = input.int(300, "Max bars per sample", group = groupExc, minval = 5, maxval = 5000)
+i_excMinSamples      = input.int(3, "Minimum completed samples to draw box", group = groupExc, minval = 1, maxval = 100)
+i_excShowLabel       = input.bool(false, "Show excursion stats label", group = groupExc)
+i_excDownColor       = input.color(color.new(color.red,  84), "Pullback box color", group = groupExc, inline = "excbox")
+i_excUpColor         = input.color(color.new(color.lime, 84), "Run-up box color",   group = groupExc, inline = "excbox")
+i_excMidLineColor    = input.color(color.new(color.white, 20), "Entry line color",  group = groupExc)
+
+groupScore = "Visual Score / Location / Volume"
+i_showLocationLabel = input.bool(true, "Show location in labels", group = groupScore)
+i_volScoreMult      = input.float(1.2, "Volume boost threshold", group = groupScore, step = 0.1, minval = 0.5)
+i_stretchPct        = input.float(6.0, "Stretch % from basis", group = groupScore, step = 0.5, minval = 1.0)
+
+groupMoney = "Money Backtest"
+i_tradeAmount = input.float(100.0, "Amount per BUY / RE-ENTRY ($)", group = groupMoney, minval = 1, step = 1)
+
+// ─────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────
+fmt2(val) =>
+    na(val) ? "n/a" : str.tostring(math.round(val * 100.0) / 100.0)
+
+formatSignedPct(val) =>
+    na(val) ? "n/a" : (val >= 0 ? "+" : "") + fmt2(val) + "%"
+
+stringSrc(source) =>
+    if source == "Open"
+        open
+    else if source == "High"
+        high
+    else if source == "Low"
+        low
+    else if source == "Close"
+        close
+    else if source == "HL2"
+        hl2
+    else if source == "HLC3"
+        hlc3
+    else if source == "HLCC4"
+        hlcc4
+    else
+        ohlc4
+
+donMid(len) =>
+    (ta.highest(high, len) + ta.lowest(low, len)) / 2.0
+
+i_source           = stringSrc(i_sourceString)
+i_thresholdUpSrc   = stringSrc(i_thresholdUpString)
+i_thresholdDownSrc = stringSrc(i_thresholdDownString)
+anchor             = timeframe.change(i_anchorTf)
+
+smoothedValue(source, length) =>
+    if i_smoothingType == "SMA"
+        ta.sma(source, length)
+    else if i_smoothingType == "EMA"
+        ta.ema(source, length)
+    else if i_smoothingType == "HMA"
+        ta.hma(source, length)
+    else if i_smoothingType == "RMA"
+        ta.rma(source, length)
+    else if i_smoothingType == "VWMA"
+        ta.vwma(source, length)
+    else if i_smoothingType == "Median"
+        ta.median(source, length)
+    else if i_smoothingType == "VWAP"
+        ta.vwap(source, anchor)
+    else
+        ta.wma(source, length)
+
+fairPriceSmooth = smoothedValue(i_source, i_length)
+
+// ─────────────────────────────────────────────────────────────
+// FAIR VALUE BANDS
+// ─────────────────────────────────────────────────────────────
+lowSpread     = low  / fairPriceSmooth
+highSpread    = high / fairPriceSmooth
+deviationDown = low < fairPriceSmooth and high > fairPriceSmooth ? lowSpread  : na
+deviationUp   = low < fairPriceSmooth and high > fairPriceSmooth ? highSpread : na
+
+var deviationUpList   = array.new_float()
+var deviationDownList = array.new_float()
+
+if array.size(deviationUpList) > 1000
+    array.remove(deviationUpList, 0)
+if array.size(deviationDownList) > 1000
+    array.remove(deviationDownList, 0)
+
+if not na(deviationUp)
+    array.push(deviationUpList, deviationUp)
+if not na(deviationDown)
+    array.push(deviationDownList, deviationDown)
+
+medianUpDeviation   = array.size(deviationUpList) > 0 ? array.median(deviationUpList) : 1.01
+medianDownDeviation = array.size(deviationDownList) > 0 ? array.median(deviationDownList) : 0.99
+
+upperBand        = fairPriceSmooth * medianUpDeviation
+lowerBand        = fairPriceSmooth * medianDownDeviation
+bandUpSpread     = upperBand - fairPriceSmooth
+bandDownSpread   = fairPriceSmooth - lowerBand
+upperBandBoosted = fairPriceSmooth + (bandUpSpread   * i_boost)
+lowerBandBoosted = fairPriceSmooth - (bandDownSpread * i_boost)
+
+var int dirSwitch = 0
+trendRuleUp   = i_trendMode == "Cross" ? i_thresholdUpSrc   > upperBandBoosted : fairPriceSmooth > fairPriceSmooth[1]
+trendRuleDown = i_trendMode == "Cross" ? i_thresholdDownSrc < lowerBandBoosted : fairPriceSmooth < fairPriceSmooth[1]
+
+if trendRuleDown
+    dirSwitch := -1
+else if trendRuleUp
+    dirSwitch := 1
+
+ohlcSpread = ohlc4 / fairPriceSmooth
+
+var pivotUps   = array.new_float()
+var pivotDowns = array.new_float()
+
+if array.size(pivotUps) > 2000
+    array.remove(pivotUps, 0)
+if array.size(pivotDowns) > 2000
+    array.remove(pivotDowns, 0)
+
+pivotUp   = ta.pivothigh(ohlcSpread, 5, 5)
+pivotDown = ta.pivotlow(ohlcSpread,  5, 5)
+
+if low > upperBand and not na(pivotUp)
+    array.push(pivotUps, pivotUp)
+else if high < lowerBand and not na(pivotDown)
+    array.push(pivotDowns, pivotDown)
+
+medianPivotUp   = array.size(pivotUps) > 0 ? array.median(pivotUps) : 1.03
+medianPivotDown = array.size(pivotDowns) > 0 ? array.median(pivotDowns) : 0.97
+
+pBandUpSpread   = (fairPriceSmooth * medianPivotUp   - fairPriceSmooth) * i_bandBoost
+pBandDownSpread = (fairPriceSmooth - fairPriceSmooth * medianPivotDown) * i_bandBoost
+
+pivotBandUp    = fairPriceSmooth + pBandUpSpread
+pivotBandDown  = fairPriceSmooth - pBandDownSpread
+pivotBandUp2   = pivotBandUp    + pBandUpSpread
+pivotBandDown2 = pivotBandDown  - pBandDownSpread
+pivotBandUp3   = pivotBandUp2   + pBandUpSpread
+pivotBandDown3 = pivotBandDown2 - pBandDownSpread
+
+tpAtr    = ta.atr(i_tpAtrLen)
+atrTrail = ta.atr(i_atrTrailLen)
+
+// ─────────────────────────────────────────────────────────────
+// WEEKLY FVB (bull cycle component)
+// ─────────────────────────────────────────────────────────────
+srcForWeekly = stringSrc(i_sourceString)
+
+fvb_basis_w = switch i_smoothingType
+    "SMA"    => request.security(syminfo.tickerid, "W", ta.sma(srcForWeekly, i_length),    lookahead = barmerge.lookahead_off)
+    "EMA"    => request.security(syminfo.tickerid, "W", ta.ema(srcForWeekly, i_length),    lookahead = barmerge.lookahead_off)
+    "HMA"    => request.security(syminfo.tickerid, "W", ta.hma(srcForWeekly, i_length),    lookahead = barmerge.lookahead_off)
+    "RMA"    => request.security(syminfo.tickerid, "W", ta.rma(srcForWeekly, i_length),    lookahead = barmerge.lookahead_off)
+    "WMA"    => request.security(syminfo.tickerid, "W", ta.wma(srcForWeekly, i_length),    lookahead = barmerge.lookahead_off)
+    "VWMA"   => request.security(syminfo.tickerid, "W", ta.vwma(srcForWeekly, i_length),   lookahead = barmerge.lookahead_off)
+    "Median" => request.security(syminfo.tickerid, "W", ta.median(srcForWeekly, i_length), lookahead = barmerge.lookahead_off)
+    "VWAP"   => request.security(syminfo.tickerid, "W", ta.vwap(srcForWeekly),             lookahead = barmerge.lookahead_off)
+    =>          request.security(syminfo.tickerid, "W", ta.sma(srcForWeekly, i_length),    lookahead = barmerge.lookahead_off)
+
+fvb_threshUpSrc_w = request.security(syminfo.tickerid, "W", stringSrc(i_thresholdUpString), lookahead = barmerge.lookahead_off)
+fvb_threshDnSrc_w = request.security(syminfo.tickerid, "W", stringSrc(i_thresholdDownString), lookahead = barmerge.lookahead_off)
+weeklyClose_w     = request.security(syminfo.tickerid, "W", close, lookahead = barmerge.lookahead_off)
+
+fvb_upperBoosted_w = fvb_basis_w + (fvb_basis_w * medianUpDeviation   - fvb_basis_w) * i_boost
+fvb_lowerBoosted_w = fvb_basis_w - (fvb_basis_w - fvb_basis_w * medianDownDeviation) * i_boost
+
+fvb_trendRuleUp_w   = i_trendMode == "Cross" ? fvb_threshUpSrc_w > fvb_upperBoosted_w : fvb_basis_w > fvb_basis_w[1]
+fvb_trendRuleDown_w = i_trendMode == "Cross" ? fvb_threshDnSrc_w < fvb_lowerBoosted_w : fvb_basis_w < fvb_basis_w[1]
+
+var int dirSwitch_w = 0
+if fvb_trendRuleDown_w
+    dirSwitch_w := -1
+else if fvb_trendRuleUp_w
+    dirSwitch_w := 1
+
+weeklyBarClose    = timeframe.change("W")
+fvb_turnedGreen_w = weeklyBarClose and dirSwitch_w[1] == -1 and dirSwitch_w == 1
+fvb_turnedRed_w   = weeklyBarClose and dirSwitch_w[1] == 1  and dirSwitch_w == -1
+weeklyCloseInBand = weeklyClose_w <= fvb_upperBoosted_w and weeklyClose_w >= fvb_lowerBoosted_w
+
+// ─────────────────────────────────────────────────────────────
+// B-XTRENDER (monthly + weekly)
+// ─────────────────────────────────────────────────────────────
+bx_shortTerm_m = request.security(syminfo.tickerid, "M", ta.rsi(ta.ema(close, short_l1) - ta.ema(close, short_l2), short_l3) - 50, lookahead = barmerge.lookahead_off)
+bx_shortTerm_w = request.security(syminfo.tickerid, "W", ta.rsi(ta.ema(close, short_l1) - ta.ema(close, short_l2), short_l3) - 50, lookahead = barmerge.lookahead_off)
+
+monthlyBarClose = timeframe.change("M")
+
+bx_isDarkRed_m    = bx_shortTerm_m < 0 and bx_shortTerm_m < bx_shortTerm_m[1]
+bx_isNotDarkRed_m = not bx_isDarkRed_m
+bx_isDarkRed_w    = bx_shortTerm_w < 0 and bx_shortTerm_w < bx_shortTerm_w[1]
+bx_isNotDarkRed_w = not bx_isDarkRed_w
+
+var bool bx_monthlyNotDarkRed = false
+var bool bx_monthlyDarkRed    = false
+
+if monthlyBarClose
+    bx_monthlyNotDarkRed := bx_isNotDarkRed_m
+    bx_monthlyDarkRed    := bx_isDarkRed_m
+
+// ─────────────────────────────────────────────────────────────
+// DONCHIAN BX (weekly) — direction is the signal, color ignored
+// ─────────────────────────────────────────────────────────────
+donBx_w = request.security(syminfo.tickerid, "W", ta.ema(ta.rsi(donMid(i_donL1) - donMid(i_donL2), i_donL3) - 50, i_donSmooth), lookahead = barmerge.lookahead_off)
+
+donBxRising  = donBx_w > donBx_w[1]
+donBxFalling = donBx_w < donBx_w[1]
+
+// Consecutive falling weekly closes — used for exit hysteresis
+var int donFallStreak = 0
+if weeklyBarClose
+    donFallStreak := donBxFalling ? donFallStreak + 1 : 0
+
+// ─────────────────────────────────────────────────────────────
+// DAILY VOLATILITY FILTER — avg absolute daily % move over lookback
+// ─────────────────────────────────────────────────────────────
+dailyVolPct = request.security(syminfo.tickerid, "D", ta.sma(math.abs(close - close[1]) / close[1] * 100.0, i_volLookback), lookahead = barmerge.lookahead_off)
+volFilterPass = not i_useVolFilter or (not na(dailyVolPct) and dailyVolPct >= i_volMinPct)
+
+// ─────────────────────────────────────────────────────────────
+// MARKET REGIME FILTER — index above its daily 200 SMA, confirmed
+// ─────────────────────────────────────────────────────────────
+spyDaysAbove = request.security(i_regimeSymbol, "D", ta.barssince(close <= ta.sma(close, i_regimeMaLen)), lookahead = barmerge.lookahead_off)
+regimeOk = not i_useRegime or na(spyDaysAbove) or spyDaysAbove >= i_regimeConfirmDays
+
+// ─────────────────────────────────────────────────────────────
+// 12-1 MOMENTUM — 12-month return excluding the most recent month
+// ─────────────────────────────────────────────────────────────
+mom121 = request.security(syminfo.tickerid, "D", bar_index >= 252 ? (close[21] / close[252] - 1.0) * 100.0 : na, lookahead = barmerge.lookahead_off)
+
+// ─────────────────────────────────────────────────────────────
+// POSITION SIZE — equal-risk sizing from daily ATR (display only)
+// ─────────────────────────────────────────────────────────────
+dAtrSize     = request.security(syminfo.tickerid, "D", ta.atr(i_atrLenSize), lookahead = barmerge.lookahead_off)
+riskPerShare = dAtrSize * i_atrMultSize
+float sizeShares = na
+if not na(riskPerShare) and riskPerShare > 0 and close > 0
+    sizeShares := (i_accountSize * i_riskPct / 100.0) / riskPerShare
+    sizeShares := math.min(sizeShares, i_accountSize / close)  // never suggest more than 100% of account
+float sizeValue = not na(sizeShares) ? sizeShares * close : na
+
+// ─────────────────────────────────────────────────────────────
+// SCORING / LOCATION / VOLUME
+// ─────────────────────────────────────────────────────────────
+volSma        = ta.sma(volume, 20)
+volMultiplier = na(volSma) or volSma == 0 ? 0.0 : volume / volSma
+volHigh       = volMultiplier >= i_volScoreMult
+
+pctFromBasis  = fairPriceSmooth != 0 ? math.abs(close - fairPriceSmooth) / fairPriceSmooth * 100.0 : 0.0
+isCheap       = close <= fairPriceSmooth
+isIdeal       = close > fairPriceSmooth and close <= pivotBandUp
+isStretched   = close > pivotBandUp2 or pctFromBasis >= i_stretchPct
+isExtended    = close > pivotBandUp3
+
+locationText = isCheap ? "Cheap" : isIdeal ? "Ideal" : isExtended ? "Extended" : isStretched ? "Stretched" : "Neutral"
+
+bullCandle   = close > open
+strongClose  = high > low ? close >= (high - (high - low) * 0.30) : false
+candleStrong = bullCandle and strongClose
+
+score1 = dirSwitch_w == 1 ? 1 : 0
+score2 = bx_monthlyNotDarkRed ? 1 : 0
+score3 = bx_isNotDarkRed_w ? 1 : 0
+score4 = close > fairPriceSmooth ? 1 : 0
+score5 = candleStrong ? 1 : 0
+score6 = volFilterPass and i_useVolFilter ? 1 : (volHigh ? 1 : 0)
+
+setupScoreRaw = score1 + score2 + score3 + score4 + score5 + score6
+setupGrade    = setupScoreRaw >= 5 ? "A+" : setupScoreRaw == 4 ? "A" : setupScoreRaw == 3 ? "B" : "C"
+
+// ─────────────────────────────────────────────────────────────
+// SIGNALS — Classic mode & Weekly DON BX mode
+// ─────────────────────────────────────────────────────────────
+useDonMode = i_strategyMode == "Weekly DON BX"
+useTrimMode = i_strategyMode == "Classic + DON Trim"
+
+bxBuyPass   = bx_monthlyNotDarkRed
+fvbBuyPass  = fvb_turnedGreen_w
+bxSellPass  = monthlyBarClose and bx_isDarkRed_m
+fvbSellPass = fvb_turnedRed_w
+
+rulesEnabled = i_useBxRule or i_useFvbRule
+
+inBullCycle = bx_monthlyNotDarkRed and dirSwitch_w == 1
+
+// Classic entry: weekly FVB turns green + monthly BX not dark red
+classicBuy =
+     rulesEnabled and
+     (i_useBxRule  ? bxBuyPass  : true) and
+     (i_useFvbRule ? fvbBuyPass : true)
+
+// DON BX entry: bull cycle active + weekly DON BX increases on confirmed weekly close
+donBuy = inBullCycle and weeklyBarClose and donBxRising
+
+buySignal =
+     barstate.isconfirmed and
+     volFilterPass and
+     regimeOk and
+     (useDonMode ? donBuy : classicBuy)
+
+// Classic exit: monthly BX dark red on monthly close, or weekly FVB turns red
+classicSellCore =
+     (i_useBxRule  and bxSellPass)  or
+     (i_useFvbRule and fvbSellPass)
+
+// DON BX exit: weekly DON BX decreases on confirmed weekly close (color ignored),
+// or the regime insurance policy fires (monthly BX closes dark red)
+donSellCore =
+     (weeklyBarClose and donBxFalling and donFallStreak >= i_donConfirmWeeks) or
+     bxSellPass
+
+sellSignalCore =
+     barstate.isconfirmed and
+     (useDonMode ? donSellCore : classicSellCore)
+
+// ─────────────────────────────────────────────────────────────
+// OPTIONAL EXITS (all default OFF — backtest showed they hurt)
+// ─────────────────────────────────────────────────────────────
+prevWeeklyLows = request.security(syminfo.tickerid, "W", ta.lowest(low[1], i_structureLookback), lookahead = barmerge.lookahead_off)
+weeklyStructureBreak =
+     i_enableStructureExit and weeklyBarClose and
+     (
+        (i_structureMode == "Basis + Prev Lows" and weeklyClose_w < fvb_basis_w and weeklyClose_w < prevWeeklyLows) or
+        (i_structureMode == "Lower Band" and weeklyClose_w < fvb_lowerBoosted_w)
+     )
+
+var int  reEntryState      = 0
+var int  reEntryAboveCount = 0
+bool     reEntrySignal     = false
+pullbackContextValid       = false
+
+var bool  inTrade                = false
+var float positionQty            = 0.0
+var float positionCostUsd        = 0.0
+var float tradeCapitalDeployed   = 0.0
+var float tradeQtyBought         = 0.0
+var float avgEntryPrice          = na
+var float trackedEntryPrice      = na
+var float realizedTradeProfitUsd = 0.0
+var float cumulativeProfitUsd    = 0.0
+var float lastTradeProfitUsd     = na
+var float totalCapitalDeployed   = 0.0
+var int   closedTrades           = 0
+var int   winningTrades          = 0
+var int   losingTrades           = 0
+var float cumulativeReturn       = 0.0
+var float lastTradeReturn        = na
+var int   totalTpSignals         = 0
+var int   totalTrimSignals       = 0
+var bool  trimmedThisEpisode     = false
+var int   totalReEntrySignals    = 0
+var float grossWinningProfitUsd  = 0.0
+var float grossLosingProfitUsd   = 0.0
+var float grossWinningReturnPct  = 0.0
+var float grossLosingReturnPct   = 0.0
+
+var bool  atrTrailActive = false
+var float atrTrailStop   = na
+
+atrStopHit = inTrade and i_enableATRTrail and atrTrailActive and not na(atrTrailStop) and close < atrTrailStop
+sellSignal = sellSignalCore or atrStopHit or weeklyStructureBreak
+
+// ─────────────────────────────────────────────────────────────
+// ADAPTIVE PULLBACK ENTRY — validated out-of-sample vs Immediate.
+// Learns each stock's own historical average pullback from its prior
+// completed trades (causal, no lookahead), waits for that depth before
+// filling, falls back to market entry if it never comes within the
+// expiry window, and defaults to Immediate until enough history exists.
+// ─────────────────────────────────────────────────────────────
+var float[] apbPastPullbacks = array.new_float()
+
+// SHADOW TRACKER — builds the historical pullback record using simple
+// immediate entry/exit on the raw signals, ALWAYS, completely independent
+// of whichever Entry Mode is actually selected. This guarantees the
+// "how much history exists" question gives the same answer regardless of
+// mode, so the informational display is consistent between Immediate and
+// AdaptivePB on the same candle.
+var bool  shadowInTrade   = false
+var float shadowEntry     = na
+var float shadowLowest    = na
+if not shadowInTrade and buySignal
+    shadowInTrade := true
+    shadowEntry   := close
+    shadowLowest  := low
+else if shadowInTrade
+    shadowLowest := math.min(shadowLowest, low)
+    if sellSignal
+        shadowPullbackPct = (shadowLowest / shadowEntry - 1.0) * 100.0
+        array.push(apbPastPullbacks, shadowPullbackPct)
+        if array.size(apbPastPullbacks) > 50
+            array.remove(apbPastPullbacks, 0)
+        shadowInTrade := false
+
+var float   apbCurLowest     = na
+var bool    apbArmed         = false
+var int     apbArmWeeks      = 0
+var float   apbArmedLevel    = na
+var float   apbLastLevel     = na
+
+useAdaptiveEntry  = i_entryMode == "AdaptivePB"
+apbHaveHistory    = array.size(apbPastPullbacks) >= i_apbMinSamples
+apbStillValid     = bx_monthlyNotDarkRed and dirSwitch_w == 1
+
+var bool   adaptiveEntryTriggeredNow = false
+var string apbFillType               = ""   // "Immediate" / "Pullback" / "Fallback"
+adaptiveEntryTriggeredNow := false
+
+if not inTrade
+    if buySignal and not apbArmed
+        if apbHaveHistory
+            avgPb = array.avg(apbPastPullbacks)
+            apbArmedLevel := close * (1 + avgPb / 100.0)
+            apbArmed      := true
+            apbArmWeeks   := 0
+        else if useAdaptiveEntry
+            adaptiveEntryTriggeredNow := true
+            apbFillType               := "Immediate (no history yet)"
+            apbLastLevel              := close
+    else if apbArmed and weeklyBarClose and barstate.isconfirmed
+        apbArmWeeks += 1
+        if low <= apbArmedLevel
+            if useAdaptiveEntry
+                adaptiveEntryTriggeredNow := true
+                apbFillType               := "Pullback"
+            apbArmed := false
+            apbLastLevel := apbArmedLevel
+        else if not apbStillValid
+            apbArmed := false                    // setup broke — stand down
+        else if apbArmWeeks >= i_apbExpiryWeeks
+            if useAdaptiveEntry
+                adaptiveEntryTriggeredNow := true
+                apbFillType               := "Fallback (expired)"
+            apbArmed := false
+            apbLastLevel := close                 // actual chase price, not the abandoned target
+
+newTradeSignal  = not inTrade and (useAdaptiveEntry ? adaptiveEntryTriggeredNow : buySignal)
+exitTradeSignal = sellSignal and inTrade
+
+// Line appears the moment a signal arms, and stays visible for the ENTIRE
+// open trade (armed → filled → held) — clearing only, explicitly, and
+// immediately on the sell signal that closes the position.
+if apbArmed
+    apbLastLevel := apbArmedLevel
+
+var line  apbArmedLine  = na
+var label apbArmedLabel = na
+apbShowLine = not exitTradeSignal and (apbArmed or (useAdaptiveEntry and (inTrade or newTradeSignal) and not na(apbLastLevel)))
+if apbShowLine
+    if not na(apbArmedLine)
+        line.delete(apbArmedLine)
+    if not na(apbArmedLabel)
+        label.delete(apbArmedLabel)
+    _lineTxt = apbArmed ? "ARMED $" + fmt2(apbArmedLevel) + "  (" + str.tostring(apbArmWeeks) + "/" + str.tostring(i_apbExpiryWeeks) + "wk)" : "PULLBACK LEVEL $" + fmt2(apbLastLevel)
+    apbArmedLine  := line.new(bar_index, apbArmed ? apbArmedLevel : apbLastLevel, bar_index + 1, apbArmed ? apbArmedLevel : apbLastLevel, xloc = xloc.bar_index, extend = extend.right, color = color.new(color.orange, 20), style = line.style_dashed, width = 2)
+    apbArmedLabel := label.new(bar_index, apbArmed ? apbArmedLevel : apbLastLevel, text = _lineTxt, xloc = xloc.bar_index, style = label.style_label_right, color = color.new(color.orange, 20), textcolor = color.white, size = size.small)
+else
+    if not na(apbArmedLine)
+        line.delete(apbArmedLine)
+        apbArmedLine := na
+    if not na(apbArmedLabel)
+        label.delete(apbArmedLabel)
+        apbArmedLabel := na
+    apbLastLevel := na
+
+if newTradeSignal
+    entryQty               = i_tradeAmount / close
+    inTrade                := true
+    positionQty            := entryQty
+    positionCostUsd        := i_tradeAmount
+    tradeCapitalDeployed   := i_tradeAmount
+    tradeQtyBought         := entryQty
+    avgEntryPrice          := positionQty > 0 ? positionCostUsd / positionQty : na
+    trackedEntryPrice      := i_useManualTrackedEntry and i_manualTrackedEntry > 0 ? i_manualTrackedEntry : avgEntryPrice
+    realizedTradeProfitUsd := 0.0
+    totalCapitalDeployed   += i_tradeAmount
+    reEntryState           := 0
+    reEntryAboveCount      := 0
+    atrTrailActive         := false
+    atrTrailStop           := na
+    trimmedThisEpisode     := false
+    apbCurLowest            := low
+    if not useAdaptiveEntry and apbArmed
+        apbLastLevel := apbArmedLevel
+        apbArmed     := false
+
+if inTrade and not na(apbCurLowest)
+    apbCurLowest := math.min(apbCurLowest, low)
+
+if exitTradeSignal
+    reEntryState      := 0
+    reEntryAboveCount := 0
+    atrTrailActive    := false
+    atrTrailStop      := na
+    trackedEntryPrice := na
+    trimmedThisEpisode := false
+    apbCurLowest := na
+    if not na(apbArmedLine)
+        line.delete(apbArmedLine)
+        apbArmedLine := na
+    if not na(apbArmedLabel)
+        label.delete(apbArmedLabel)
+        apbArmedLabel := na
+    apbLastLevel := na
+
+pullbackContextValid := inTrade and bx_monthlyNotDarkRed and dirSwitch_w == 1
+reEntrySignal := false
+
+if i_enableReEntry and weeklyBarClose and barstate.isconfirmed and inTrade
+    reInBand    = weeklyCloseInBand
+    reAboveBand = weeklyClose_w > fvb_upperBoosted_w
+
+    if reEntryState == 0
+        if reInBand and pullbackContextValid
+            reEntryState      := 1
+            reEntryAboveCount := 0
+    else if reEntryState == 1
+        if not pullbackContextValid
+            reEntryState      := 0
+            reEntryAboveCount := 0
+        else if bx_isDarkRed_w
+            reEntryAboveCount := -1
+        else if bx_isNotDarkRed_w and reEntryAboveCount == -1 and weeklyClose_w > fvb_basis_w
+            reEntrySignal     := true
+            reEntryState      := 2
+            reEntryAboveCount := 0
+    else if reEntryState == 2
+        if reAboveBand
+            reEntryAboveCount := reEntryAboveCount + 1
+        else
+            reEntryAboveCount := 0
+        if reEntryAboveCount >= 2
+            reEntryState      := 0
+            reEntryAboveCount := 0
+
+if reEntrySignal and inTrade
+    reQty                = i_tradeAmount / close
+    positionQty          += reQty
+    positionCostUsd      += i_tradeAmount
+    tradeCapitalDeployed += i_tradeAmount
+    tradeQtyBought       += reQty
+    avgEntryPrice        := positionQty > 0 ? positionCostUsd / positionQty : na
+    trackedEntryPrice    := i_useManualTrackedEntry and i_manualTrackedEntry > 0 ? i_manualTrackedEntry : avgEntryPrice
+    totalCapitalDeployed += i_tradeAmount
+    totalReEntrySignals  += 1
+
+// ─────────────────────────────────────────────────────────────
+// DON TRIM (Classic + DON Trim mode) — validated across 42 tickers:
+// selling a fraction of the position when DON BX starts falling while
+// deeply in profit improved both net profit and drawdown vs plain Classic,
+// and held up better out-of-sample too. Fires at most once per falling episode.
+// ─────────────────────────────────────────────────────────────
+trimSignal = false
+if useTrimMode and inTrade and weeklyBarClose and barstate.isconfirmed and positionQty > 0 and not na(trackedEntryPrice) and trackedEntryPrice > 0
+    newFallingEpisode = donBxFalling and not donBxFalling[1]
+    unrealizedPct = (close - trackedEntryPrice) / trackedEntryPrice * 100.0
+    if newFallingEpisode and not trimmedThisEpisode and unrealizedPct >= i_trimTriggerPct
+        trimSignal := true
+    if donBxRising
+        trimmedThisEpisode := false
+
+var float trimLastPrice = na
+var float trimLastPct   = na
+
+if trimSignal
+    trimQty        = positionQty * (i_trimFraction / 100.0)
+    avgCostPerUnit = positionQty > 0 ? positionCostUsd / positionQty : na
+    trimRevenueUsd = trimQty * close
+    trimCostUsd    = trimQty * avgCostPerUnit
+    trimProfitUsd  = trimRevenueUsd - trimCostUsd
+
+    positionQty          -= trimQty
+    positionCostUsd       -= trimCostUsd
+    avgEntryPrice         := positionQty > 0 ? positionCostUsd / positionQty : na
+    realizedTradeProfitUsd += trimProfitUsd
+    cumulativeProfitUsd    += trimProfitUsd
+    trimmedThisEpisode     := true
+    totalTrimSignals       += 1
+    trimLastPrice           := close
+    trimLastPct             := (close - trackedEntryPrice) / trackedEntryPrice * 100.0
+
+// ─────────────────────────────────────────────────────────────
+// PARTIAL TP (default OFF)
+// ─────────────────────────────────────────────────────────────
+var bool  tpTrackingActive = false
+var float tpEntryPrice     = na
+var float tpOriginalQty    = na
+var int   tpStepCount      = 0
+var float tpLastFirePrice  = na
+var int   tpLastFireLevel  = 0
+var float tpTotalSoldPct   = 0.0
+var line  tpTargetLine     = na
+var label tpTargetLabel    = na
+
+if newTradeSignal
+    tpTrackingActive := true
+    tpEntryPrice     := trackedEntryPrice
+    tpOriginalQty    := tradeQtyBought
+    tpStepCount      := 0
+    tpLastFirePrice  := na
+    tpLastFireLevel  := 0
+    tpTotalSoldPct   := 0.0
+
+if exitTradeSignal
+    tpTrackingActive := false
+    tpEntryPrice     := na
+    tpOriginalQty    := na
+    tpStepCount      := 0
+    tpLastFirePrice  := na
+    tpLastFireLevel  := 0
+    tpTotalSoldPct   := 0.0
+    if not na(tpTargetLine)
+        line.delete(tpTargetLine)
+        tpTargetLine := na
+    if not na(tpTargetLabel)
+        label.delete(tpTargetLabel)
+        tpTargetLabel := na
+
+if reEntrySignal and inTrade
+    tpEntryPrice    := trackedEntryPrice
+    tpOriginalQty   := positionQty
+    tpStepCount     := 0
+    tpLastFirePrice := na
+    tpLastFireLevel := 0
+    tpTotalSoldPct  := 0.0
+
+tpLevel_next = tpStepCount + 1
+float nextTpPrice = na
+if tpTrackingActive and inTrade and not na(tpEntryPrice)
+    if i_tpMode == "Percent"
+        nextTpPrice := tpEntryPrice * (1.0 + (i_tpStepPercent / 100.0) * tpLevel_next)
+    else if i_tpMode == "ATR"
+        atrVal = not na(tpAtr) ? tpAtr : tpEntryPrice * 0.05
+        nextTpPrice := tpEntryPrice + atrVal * i_tpAtrMult * tpLevel_next
+    else if i_tpMode == "Band"
+        bandTarget = tpLevel_next == 1 ? pivotBandUp : tpLevel_next == 2 ? pivotBandUp2 : pivotBandUp3
+        if not na(bandTarget) and bandTarget > tpEntryPrice
+            nextTpPrice := bandTarget
+        else
+            nextTpPrice := tpEntryPrice * (1.0 + (i_tpStepPercent / 100.0) * tpLevel_next)
+
+if i_enablePartialTP and inTrade and not na(nextTpPrice) and tpTotalSoldPct < 100.0
+    if not na(tpTargetLine)
+        line.delete(tpTargetLine)
+        tpTargetLine := na
+    tpTargetLine := line.new(bar_index, nextTpPrice, bar_index + 1, nextTpPrice, xloc = xloc.bar_index, extend = extend.right, color = color.new(i_tpLabelColor, 30), style = line.style_dashed, width = 1)
+    if not na(tpTargetLabel)
+        label.delete(tpTargetLabel)
+        tpTargetLabel := na
+    tpTargetLabel := label.new(bar_index, nextTpPrice, text = "TP" + str.tostring(tpLevel_next) + " " + i_tpMode + "  $" + fmt2(nextTpPrice), xloc = xloc.bar_index, style = label.style_label_right, color = color.new(i_tpLabelColor, 30), textcolor = color.white, size = size.small)
+else
+    if not na(tpTargetLine)
+        line.delete(tpTargetLine)
+        tpTargetLine := na
+    if not na(tpTargetLabel)
+        label.delete(tpTargetLabel)
+        tpTargetLabel := na
+
+partialTpSignal = i_enablePartialTP and barstate.isconfirmed and tpTrackingActive and inTrade and not exitTradeSignal and not na(nextTpPrice) and high >= nextTpPrice and positionQty > 0 and tpTotalSoldPct < 100.0
+
+if partialTpSignal
+    if not na(tpTargetLine)
+        line.delete(tpTargetLine)
+        tpTargetLine := na
+    if not na(tpTargetLabel)
+        label.delete(tpTargetLabel)
+        tpTargetLabel := na
+
+    tpLevel = tpStepCount + 1
+    tpLastFirePrice := nextTpPrice
+    tpLastFireLevel := tpLevel
+
+    float tpSellFraction = tpLevel == 1 ? i_tpSellPct1 / 100.0 : tpLevel == 2 ? i_tpSellPct2 / 100.0 : i_tpSellPct3 / 100.0
+    maxAllowedPct = math.max(0.0, 100.0 - tpTotalSoldPct) / 100.0
+    tpSellFraction := math.min(tpSellFraction, maxAllowedPct)
+    qtyToSell      = math.min(tpOriginalQty * tpSellFraction, positionQty)
+    avgCostPerUnit = positionQty > 0 ? positionCostUsd / positionQty : na
+    tpRevenueUsd   = qtyToSell * nextTpPrice
+    tpCostUsd      = qtyToSell * avgCostPerUnit
+    tpProfitUsd    = tpRevenueUsd - tpCostUsd
+
+    positionQty     -= qtyToSell
+    positionCostUsd -= tpCostUsd
+    avgEntryPrice   := positionQty > 0 ? positionCostUsd / positionQty : na
+
+    realizedTradeProfitUsd += tpProfitUsd
+    cumulativeProfitUsd    += tpProfitUsd
+    tpTotalSoldPct         += tpSellFraction * 100.0
+    tpStepCount            += 1
+    totalTpSignals         += 1
+
+    if i_enableATRTrail and (not i_atrTrailAfterTP1 or tpStepCount >= 1)
+        atrTrailActive := true
+
+if inTrade and i_enableATRTrail and atrTrailActive and not na(atrTrail)
+    newStop = close - atrTrail * i_atrTrailMult
+    atrTrailStop := na(atrTrailStop) ? newStop : math.max(atrTrailStop, newStop)
+
+// ─────────────────────────────────────────────────────────────
+// EXCURSION STUDY
+// ─────────────────────────────────────────────────────────────
+var float[] excPullbackPctArr = array.new_float()
+var float[] excRunupPctArr    = array.new_float()
+var bool  excSampleActive  = false
+var float excEntryPrice    = na
+var float excLowestLow     = na
+var float excHighestHigh   = na
+var int   excStartBarIndex = na
+var box   excDownBox       = na
+var box   excUpBox         = na
+var line  excMidLine       = na
+var label excStatsLabel    = na
+
+if exitTradeSignal and excSampleActive and not na(excEntryPrice)
+    excPb_sell = ((excLowestLow  / excEntryPrice) - 1.0) * 100.0
+    excRu_sell = ((excHighestHigh / excEntryPrice) - 1.0) * 100.0
+    array.push(excPullbackPctArr, excPb_sell)
+    array.push(excRunupPctArr,    excRu_sell)
+    if array.size(excPullbackPctArr) > i_excMaxSamples
+        array.remove(excPullbackPctArr, 0)
+    if array.size(excRunupPctArr) > i_excMaxSamples
+        array.remove(excRunupPctArr, 0)
+    excSampleActive  := false
+    excEntryPrice    := na
+    excLowestLow     := na
+    excHighestHigh   := na
+    excStartBarIndex := na
+
+if excSampleActive and barstate.isconfirmed
+    excLowestLow   := math.min(excLowestLow,  low)
+    excHighestHigh := math.max(excHighestHigh, high)
+
+if excSampleActive and i_excUseMaxBars and not na(excStartBarIndex)
+    if (bar_index - excStartBarIndex) >= i_excMaxBars
+        if not na(excEntryPrice)
+            excPb_cap = ((excLowestLow  / excEntryPrice) - 1.0) * 100.0
+            excRu_cap = ((excHighestHigh / excEntryPrice) - 1.0) * 100.0
+            array.push(excPullbackPctArr, excPb_cap)
+            array.push(excRunupPctArr,    excRu_cap)
+            if array.size(excPullbackPctArr) > i_excMaxSamples
+                array.remove(excPullbackPctArr, 0)
+            if array.size(excRunupPctArr) > i_excMaxSamples
+                array.remove(excRunupPctArr, 0)
+        excSampleActive  := false
+        excEntryPrice    := na
+        excLowestLow     := na
+        excHighestHigh   := na
+        excStartBarIndex := na
+
+if newTradeSignal
+    if excSampleActive and not na(excEntryPrice)
+        excPb_new = ((excLowestLow  / excEntryPrice) - 1.0) * 100.0
+        excRu_new = ((excHighestHigh / excEntryPrice) - 1.0) * 100.0
+        array.push(excPullbackPctArr, excPb_new)
+        array.push(excRunupPctArr,    excRu_new)
+        if array.size(excPullbackPctArr) > i_excMaxSamples
+            array.remove(excPullbackPctArr, 0)
+        if array.size(excRunupPctArr) > i_excMaxSamples
+            array.remove(excRunupPctArr, 0)
+    excSampleActive  := true
+    excEntryPrice    := close
+    excLowestLow     := close
+    excHighestHigh   := close
+    excStartBarIndex := bar_index
+
+excCompletedSamples = array.size(excPullbackPctArr)
+excAvgPullbackPct   = excCompletedSamples > 0 ? array.avg(excPullbackPctArr) : na
+excAvgRunupPct      = excCompletedSamples > 0 ? array.avg(excRunupPctArr)    : na
+
+excHasEnoughSamples = excCompletedSamples >= i_excMinSamples and excSampleActive and not na(excEntryPrice)
+
+float excProjectedDown = na
+float excProjectedUp   = na
+if excHasEnoughSamples
+    if not na(excAvgPullbackPct)
+        excProjectedDown := excEntryPrice * (1.0 + excAvgPullbackPct / 100.0)
+    if not na(excAvgRunupPct)
+        excProjectedUp   := excEntryPrice * (1.0 + excAvgRunupPct    / 100.0)
+
+float excProjDownSafe = na
+float excProjUpSafe   = na
+if not na(excProjectedDown) and excProjectedDown > 0 and not na(excEntryPrice) and math.abs((excProjectedDown / excEntryPrice) - 1.0) < 0.90
+    excProjDownSafe := excProjectedDown
+if not na(excProjectedUp) and excProjectedUp > excEntryPrice * 1.01
+    excProjUpSafe := excProjectedUp
+
+if i_enableExcursionBox and newTradeSignal and excHasEnoughSamples and not na(excProjDownSafe) and not na(excProjUpSafe)
+    if not na(excDownBox)
+        box.delete(excDownBox)
+        excDownBox := na
+    if not na(excUpBox)
+        box.delete(excUpBox)
+        excUpBox := na
+    if not na(excMidLine)
+        line.delete(excMidLine)
+        excMidLine := na
+    if not na(excStatsLabel)
+        label.delete(excStatsLabel)
+        excStatsLabel := na
+
+    excDrawLeft  = bar_index
+    excDrawRight = bar_index + 100
+
+    excDownBox := box.new(excDrawLeft, excEntryPrice, excDrawRight, excProjDownSafe, xloc = xloc.bar_index, bgcolor = i_excDownColor, border_color = color.new(color.red, 30), border_width = 1)
+    excUpBox   := box.new(excDrawLeft, excProjUpSafe, excDrawRight, excEntryPrice, xloc = xloc.bar_index, bgcolor = i_excUpColor, border_color = color.new(color.lime, 30), border_width = 1)
+    excMidLine := line.new(excDrawLeft, excEntryPrice, excDrawRight, excEntryPrice, xloc = xloc.bar_index, extend = extend.right, color = i_excMidLineColor, style = line.style_dashed, width = 1)
+
+    if i_excShowLabel
+        excText = "Samples: " + str.tostring(excCompletedSamples) + "  Avg PB: " + formatSignedPct(excAvgPullbackPct) + "  Avg UP: " + formatSignedPct(excAvgRunupPct) + "\nPB zone: $" + fmt2(excProjDownSafe) + "  UP zone: $" + fmt2(excProjUpSafe)
+        excStatsLabel := label.new(excDrawLeft, excEntryPrice, excText, xloc = xloc.bar_index, style = label.style_label_right, color = color.new(color.black, 20), textcolor = color.white, size = size.small)
+
+if exitTradeSignal
+    if not na(excDownBox)
+        box.delete(excDownBox)
+        excDownBox := na
+    if not na(excUpBox)
+        box.delete(excUpBox)
+        excUpBox := na
+    if not na(excMidLine)
+        line.delete(excMidLine)
+        excMidLine := na
+    if not na(excStatsLabel)
+        label.delete(excStatsLabel)
+        excStatsLabel := na
+
+// ─────────────────────────────────────────────────────────────
+// TRADE CLOSE ACCOUNTING
+// ─────────────────────────────────────────────────────────────
+if exitTradeSignal
+    finalExitProfitUsd  = positionQty > 0 ? (positionQty * close - positionCostUsd) : 0.0
+    totalTradeProfitUsd = realizedTradeProfitUsd + finalExitProfitUsd
+    totalTradeReturnPct = tradeCapitalDeployed > 0 ? (totalTradeProfitUsd / tradeCapitalDeployed) * 100.0 : na
+
+    closedTrades        += 1
+    cumulativeReturn    += nz(totalTradeReturnPct)
+    cumulativeProfitUsd += finalExitProfitUsd
+    lastTradeReturn     := totalTradeReturnPct
+    lastTradeProfitUsd  := totalTradeProfitUsd
+
+    if totalTradeProfitUsd > 0
+        winningTrades         += 1
+        grossWinningProfitUsd += totalTradeProfitUsd
+        grossWinningReturnPct += nz(totalTradeReturnPct)
+    else
+        losingTrades         += 1
+        grossLosingProfitUsd += math.abs(totalTradeProfitUsd)
+        grossLosingReturnPct += math.abs(nz(totalTradeReturnPct))
+
+    inTrade                := false
+    positionQty            := 0.0
+    positionCostUsd        := 0.0
+    tradeCapitalDeployed   := 0.0
+    tradeQtyBought         := 0.0
+    avgEntryPrice          := na
+    realizedTradeProfitUsd := 0.0
+
+openTradeProfitUsd  = inTrade ? (positionQty * close - positionCostUsd) : na
+openTradeReturn     = inTrade and tradeCapitalDeployed > 0 ? (openTradeProfitUsd / tradeCapitalDeployed) * 100.0 : na
+winRatePct          = closedTrades > 0 ? (winningTrades / closedTrades) * 100.0 : na
+avgTradeReturn      = closedTrades > 0 ? cumulativeReturn / closedTrades : na
+avgWinPct           = winningTrades > 0 ? grossWinningReturnPct / winningTrades : na
+avgLossPct          = losingTrades  > 0 ? -(grossLosingReturnPct / losingTrades) : na
+profitFactor        = grossLosingProfitUsd > 0 ? grossWinningProfitUsd / grossLosingProfitUsd : na
+
+// ─────────────────────────────────────────────────────────────
+// DASHBOARD
+// ─────────────────────────────────────────────────────────────
+tablePosition = switch tablePos
+    "Top right"    => position.top_right
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    =>               position.top_left
+
+tableTextSize = switch tableSize
+    1 => size.tiny
+    2 => size.small
+    3 => size.normal
+    4 => size.huge
+    => size.large
+
+var metricTable = table.new(tablePosition, 4, 20, bgcolor = color.new(color.black, 84), border_width = 1, border_color = color.rgb(40, 40, 40))
+
+titleBg   = color.new(color.gray,   75)
+labelBg   = color.new(color.black,  88)
+greenBg   = color.new(color.green,  72)
+redBg     = color.new(color.red,    72)
+yellowBg  = color.new(color.orange, 68)
+neutralBg = color.new(color.gray,   85)
+blueBg    = color.new(color.aqua,   78)
+darkBg    = color.new(color.black,  65)
+
+if barstate.islast and i_showStrategyPane and i_dashStyle == "Full"
+    table.clear(metricTable, 0, 0, 3, 19)
+
+    trendBull = dirSwitch_w == 1
+    moBxOk    = bx_monthlyNotDarkRed
+    wkBxOk    = bx_isNotDarkRed_w
+    riskScore = (trendBull ? 0 : 2) + (moBxOk ? 0 : 2) + (wkBxOk ? 0 : 1)
+    confScore = setupScoreRaw * 15 + (inTrade ? 10 : 0)
+
+    confTxt  = confScore >= 80 ? "HIGH " + str.tostring(confScore) + "/100" : confScore >= 50 ? "MED " + str.tostring(confScore) + "/100" : "LOW " + str.tostring(confScore) + "/100"
+    confBg   = confScore >= 80 ? greenBg : confScore >= 50 ? yellowBg : redBg
+    trendTxt = trendBull ? "BULL" : "BEAR"
+    trendBg  = trendBull ? greenBg : redBg
+    moBxTxt  = moBxOk ? "OK" : "Weak"
+    wkBxTxt  = wkBxOk ? "OK" : "Weak"
+    riskTxt  = riskScore == 0 ? "LOW" : riskScore <= 2 ? "MED" : "HIGH"
+    riskBg   = riskScore == 0 ? greenBg : riskScore <= 2 ? yellowBg : redBg
+    setupTxt = newTradeSignal ? "ENTRY" : reEntrySignal ? "ADD" : inTrade ? "In Trade" : "Watching"
+    setupBg  = newTradeSignal ? greenBg : reEntrySignal ? blueBg : inTrade ? greenBg : neutralBg
+    reTxt    = not i_enableReEntry ? "Off" : reEntryState == 1 ? "Armed" : reEntryState == 2 ? "Fired" : pullbackContextValid ? "Valid" : "Off"
+    reBg     = reEntryState == 1 ? yellowBg : reEntryState == 2 ? blueBg : pullbackContextValid ? greenBg : neutralBg
+    trackedTxt = not na(trackedEntryPrice) ? "$" + fmt2(trackedEntryPrice) : "-"
+    nextTpTxt  = i_enablePartialTP and not na(nextTpPrice) ? "$" + fmt2(nextTpPrice) : "-"
+    stopTxt    = inTrade and atrTrailActive and not na(atrTrailStop) ? "ATR $" + fmt2(atrTrailStop) : dirSwitch_w == 1 ? (useDonMode ? "DON Fall" : "FVB Red") : "-"
+    openPctTxt = inTrade ? fmt2(openTradeReturn) + "%" : "-"
+    openUsdTxt = inTrade ? "$" + fmt2(openTradeProfitUsd) : "-"
+    openPnlBg  = inTrade ? (nz(openTradeReturn) >= 0 ? greenBg : redBg) : neutralBg
+    winRateTxt = not na(winRatePct) ? fmt2(winRatePct) + "%" : "n/a"
+    pfTxt      = not na(profitFactor) ? fmt2(profitFactor) : "n/a"
+    avgWinTxt  = not na(avgWinPct) ? "+" + fmt2(avgWinPct) + "%" : "n/a"
+    avgLossTxt = not na(avgLossPct) ? fmt2(avgLossPct) + "%" : "n/a"
+    pbTxt      = not na(excAvgPullbackPct) ? formatSignedPct(excAvgPullbackPct) : "n/a"
+    upTxt      = not na(excAvgRunupPct) ? formatSignedPct(excAvgRunupPct) : "n/a"
+    pbPxTxt    = not na(excProjDownSafe) ? "$" + fmt2(excProjDownSafe) : "n/a"
+    upPxTxt    = not na(excProjUpSafe) ? "$" + fmt2(excProjUpSafe) : "n/a"
+
+    donTxt   = donBxRising ? "Rising" : donBxFalling ? (donFallStreak > 1 ? "Fall x" + str.tostring(donFallStreak) : "Falling") : "Flat"
+    regimeTxt = not i_useRegime ? "Off" : regimeOk ? "RISK ON" : "RISK OFF"
+    regimeBg  = not i_useRegime ? neutralBg : regimeOk ? greenBg : redBg
+    momTxt    = not na(mom121) ? formatSignedPct(mom121) : "n/a"
+    momBg     = na(mom121) ? neutralBg : mom121 > 0 ? greenBg : redBg
+    sharesTxt = not na(sizeShares) ? str.tostring(math.floor(sizeShares)) + " sh" : "n/a"
+    posValTxt = not na(sizeValue) ? "$" + fmt2(math.min(sizeValue, math.floor(sizeShares) * close)) : "n/a"
+    donBg    = donBxRising ? greenBg : donBxFalling ? redBg : neutralBg
+    volTxt   = not na(dailyVolPct) ? fmt2(dailyVolPct) + "%" : "n/a"
+    volBg    = not i_useVolFilter ? neutralBg : volFilterPass ? greenBg : redBg
+    titleTxt = useDonMode ? "THT DASHBOARD — DON BX" : useTrimMode ? "THT DASHBOARD — CLASSIC+TRIM" : "THT DASHBOARD — CLASSIC"
+
+    table.cell(metricTable, 0, 0, titleTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = titleBg)
+    table.merge_cells(metricTable, 0, 0, 3, 0)
+
+    table.cell(metricTable, 0, 1, confTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = confBg)
+    table.merge_cells(metricTable, 0, 1, 1, 1)
+    table.cell(metricTable, 2, 1, setupTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = setupBg)
+    table.merge_cells(metricTable, 2, 1, 3, 1)
+
+    table.cell(metricTable, 0, 2, "Trend", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 1, 2, trendTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = trendBg)
+    table.cell(metricTable, 2, 2, "Risk", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 3, 2, riskTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = riskBg)
+
+    table.cell(metricTable, 0, 3, "Mo Mom", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 1, 3, moBxTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = moBxOk ? greenBg : redBg)
+    table.cell(metricTable, 2, 3, "Wk Mom", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 3, 3, wkBxTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = wkBxOk ? greenBg : redBg)
+
+    table.cell(metricTable, 0, 4, "DON BX", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 1, 4, donTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = donBg)
+    table.cell(metricTable, 2, 4, "Volat", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 3, 4, volTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = volBg)
+
+    table.cell(metricTable, 0, 5, "Tracked", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 1, 5, trackedTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = neutralBg)
+    table.cell(metricTable, 2, 5, "Re-entry", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 3, 5, reTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = reBg)
+
+    table.cell(metricTable, 0, 6, inTrade ? "LONG" : "FLAT", text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = inTrade ? greenBg : redBg)
+    table.merge_cells(metricTable, 0, 6, 1, 6)
+    table.cell(metricTable, 2, 6, "Avg Entry", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 3, 6, na(avgEntryPrice) ? "-" : "$" + fmt2(avgEntryPrice), text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = neutralBg)
+
+    table.cell(metricTable, 0, 7, "Target", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 1, 7, nextTpTxt, text_color = color.aqua, text_halign = text.align_center, text_size = tableTextSize, bgcolor = blueBg)
+    table.cell(metricTable, 2, 7, "Stop", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 3, 7, stopTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = yellowBg)
+
+    table.cell(metricTable, 0, 8, "P&L %", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 1, 8, openPctTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = openPnlBg)
+    table.cell(metricTable, 2, 8, "P&L $", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 3, 8, openUsdTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = openPnlBg)
+
+    table.cell(metricTable, 0, 9, "Regime", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 1, 9, regimeTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = regimeBg)
+    table.cell(metricTable, 2, 9, "12-1 Mom", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 3, 9, momTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = momBg)
+
+    table.cell(metricTable, 0, 10, "Win Rate", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 1, 10, winRateTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = not na(winRatePct) and winRatePct >= 50 ? greenBg : redBg)
+    table.cell(metricTable, 2, 10, "Prof Factor", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 3, 10, pfTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = not na(profitFactor) and profitFactor >= 1.0 ? greenBg : redBg)
+
+    table.cell(metricTable, 0, 11, "Avg Win", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 1, 11, avgWinTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = greenBg)
+    table.cell(metricTable, 2, 11, "Avg Loss", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 3, 11, avgLossTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = redBg)
+
+    table.cell(metricTable, 0, 13, "Avg PB", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 1, 13, pbTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = redBg)
+    table.cell(metricTable, 2, 13, "Avg UP", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 3, 13, upTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = greenBg)
+
+    table.cell(metricTable, 0, 14, "PB Px", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 1, 14, pbPxTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = redBg)
+    table.cell(metricTable, 2, 14, "UP Px", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 3, 14, upPxTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = greenBg)
+
+    table.cell(metricTable, 0, 16, "Size @" + fmt2(i_riskPct) + "%", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 1, 16, sharesTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = blueBg)
+    table.cell(metricTable, 2, 16, "Pos Value", text_color = color.white, text_halign = text.align_left, text_size = tableTextSize, bgcolor = labelBg)
+    table.cell(metricTable, 3, 16, posValTxt, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = blueBg)
+
+if barstate.islast and i_showStrategyPane and i_dashStyle == "Compact"
+    table.clear(metricTable, 0, 0, 3, 19)
+
+    cState    = inTrade ? "LONG " + formatSignedPct(openTradeReturn) : apbArmed ? "ARMED" : newTradeSignal ? "ENTRY" : "FLAT"
+    cStateBg  = inTrade ? (nz(openTradeReturn) >= 0 ? greenBg : redBg) : apbArmed ? color.new(color.orange, 68) : newTradeSignal ? greenBg : neutralBg
+    cRegime   = not i_useRegime ? "Rgm off" : regimeOk ? "Rgm ON" : "Rgm OFF"
+    cRegimeBg = not i_useRegime ? neutralBg : regimeOk ? greenBg : redBg
+    cVol      = "Vol " + (na(dailyVolPct) ? "n/a" : fmt2(dailyVolPct) + "%")
+    cVolBg    = not i_useVolFilter ? neutralBg : volFilterPass ? greenBg : redBg
+    cCycle    = inBullCycle ? "Cycle ✓" : "Cycle ✗"
+    cCycleBg  = inBullCycle ? greenBg : redBg
+    cDon      = "DON " + (donBxRising ? "▲" : donBxFalling ? "▼" + (donFallStreak > 1 ? str.tostring(donFallStreak) : "") : "–")
+    cDonBg    = donBxRising ? greenBg : donBxFalling ? redBg : neutralBg
+    cSize     = not na(sizeShares) ? str.tostring(math.floor(sizeShares)) + " sh" : "n/a"
+    cMom      = "M " + (na(mom121) ? "n/a" : formatSignedPct(mom121))
+    cMomBg    = na(mom121) ? neutralBg : mom121 > 0 ? greenBg : redBg
+
+    table.cell(metricTable, 0, 0, useDonMode ? "DON" : useTrimMode ? "C+TRIM" : "CLSC", text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = titleBg)
+    table.cell(metricTable, 1, 0, cState, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = cStateBg)
+    table.cell(metricTable, 0, 1, cRegime, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = cRegimeBg)
+    table.cell(metricTable, 1, 1, cVol, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = cVolBg)
+    table.cell(metricTable, 0, 2, cCycle, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = cCycleBg)
+    table.cell(metricTable, 1, 2, cDon, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = cDonBg)
+    table.cell(metricTable, 0, 3, cSize, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = blueBg)
+    table.cell(metricTable, 1, 3, cMom, text_color = color.white, text_halign = text.align_center, text_size = tableTextSize, bgcolor = cMomBg)
+
+if barstate.islast and not i_showStrategyPane
+    table.clear(metricTable, 0, 0, 3, 19)
+
+// ─────────────────────────────────────────────────────────────
+// PLOTS
+// ─────────────────────────────────────────────────────────────
+midColorLine = dirSwitch == 1 ? i_upColorLine : i_downColorLine
+midColorBand = dirSwitch == 1 ? i_upColorFill : i_downColorFill
+midColorLineFinal = i_chartStyle == "Classic" ? midColorLine : color.new(midColorLine, 100)
+midColorBandFinal = i_chartStyle == "Classic" ? midColorBand : color.new(color.white, 100)
+
+plot(fairPriceSmooth, "Fair value basis", color = midColorLineFinal, linewidth = 1, display = display.all - display.status_line)
+plot(pivotBandUp, "FVB deviation band up 1x", color = deviationBandColor, display = display.none)
+plot(pivotBandDown, "FVB deviation band down 1x", color = deviationBandColor, display = display.none)
+plot(pivotBandUp2, "FVB deviation band up 2x", color = deviationBandColor, display = display.none)
+plot(pivotBandDown2, "FVB deviation band down 2x", color = deviationBandColor, display = display.none)
+plot(pivotBandUp3, "FVB deviation band up 3x", color = deviationBandColor, display = display.none)
+plot(pivotBandDown3, "FVB deviation band down 3x", color = deviationBandColor, display = display.none)
+
+pFillU = plot(upperBandBoosted, "Threshold fill upper", color = color.new(color.white, 100), display = display.none)
+pFillL = plot(lowerBandBoosted, "Threshold fill lower", color = color.new(color.white, 100), display = display.none)
+fill(pFillU, pFillL, color = midColorBandFinal, title = "Threshold band fill")
+
+plot(excSampleActive and not na(excProjDownSafe) ? excProjDownSafe : na, "Excursion PB Zone", color = color.red, style = plot.style_linebr, linewidth = 3, display = display.all - display.status_line)
+plot(excSampleActive and not na(excProjUpSafe) ? excProjUpSafe : na, "Excursion UP Zone", color = color.lime, style = plot.style_linebr, linewidth = 3, display = display.all - display.status_line)
+plot(excSampleActive and not na(excEntryPrice) ? excEntryPrice : na, "Excursion Entry", color = color.new(color.white, 30), style = plot.style_linebr, linewidth = 1, display = display.all - display.status_line)
+
+plot(i_showATRTrailLine and i_enableATRTrail and inTrade and atrTrailActive ? atrTrailStop : na, "ATR Trail", color = i_atrTrailColor, style = plot.style_linebr, linewidth = 2)
+
+// Data window values for the new components
+plot(donBx_w, "Weekly DON BX", color = color.new(color.aqua, 0), display = display.data_window)
+plot(dailyVolPct, "Avg daily move % (1mo)", color = color.new(color.orange, 0), display = display.data_window)
+
+// ─────────────────────────────────────────────────────────────
+// LABELS
+// ─────────────────────────────────────────────────────────────
+volFilterText  = i_useVolFilter ? "\nVol " + fmt2(dailyVolPct) + "% / " + fmt2(i_volMinPct) + "%" : ""
+entryExtraText = "\n" + setupGrade + (i_showLocationLabel ? " | " + locationText : "") + "\n" + (volHigh ? "High " : "Low ") + "x" + fmt2(volMultiplier) + volFilterText
+addExtraText   = entryExtraText
+
+if newTradeSignal and i_showBuyLabel and i_chartStyle == "Classic"
+    _entryStyle = close <= fairPriceSmooth ? label.style_label_up : label.style_label_down
+    _entryY     = close <= fairPriceSmooth ? low : high
+    _fillTypeText = useAdaptiveEntry ? "\n[" + apbFillType + "]" : ""
+    label.new(bar_index, _entryY, text  = "ENTRY\n$" + fmt2(close) + _fillTypeText + entryExtraText, style = _entryStyle, color = color.new(i_buyCol, 20), textcolor = color.white, size  = size.normal)
+
+if reEntrySignal and i_showReEntryLabel and i_chartStyle == "Classic"
+    _addStyle = close <= fairPriceSmooth ? label.style_label_up : label.style_label_down
+    _addY     = close <= fairPriceSmooth ? low : high
+    label.new(bar_index, _addY, text  = "ADD\n$" + fmt2(close) + addExtraText, style = _addStyle, color = color.new(i_reEntryCol, 20), textcolor = color.white, size  = size.normal)
+
+if exitTradeSignal and i_showSellLabel and i_chartStyle == "Classic"
+    _exitStyle = close <= fairPriceSmooth ? label.style_label_up : label.style_label_down
+    _exitY     = close <= fairPriceSmooth ? low : high
+    _exitReason = atrStopHit ? "ATR EXIT" : weeklyStructureBreak ? "STRUCT EXIT" : useDonMode and weeklyBarClose and donBxFalling and not bxSellPass ? "DON EXIT" : "EXIT"
+    _exitText  = _exitReason + "\n" + formatSignedPct(lastTradeReturn) + "\n$" + fmt2(close)
+    label.new(bar_index, _exitY, text  = _exitText, style = _exitStyle, color = color.new(i_sellCol, 20), textcolor = color.white, size  = size.normal)
+
+if partialTpSignal and i_showTPLabels and i_chartStyle == "Classic"
+    tpLvlText    = "TP" + str.tostring(tpLastFireLevel)
+    tpLabelPrice = not na(tpLastFirePrice) ? tpLastFirePrice : high
+    tpReturnPct  = not na(tpEntryPrice) and tpEntryPrice > 0 ? ((tpLabelPrice / tpEntryPrice) - 1.0) * 100.0 : na
+    tpReturnStr  = not na(tpReturnPct) ? formatSignedPct(tpReturnPct) : ""
+    label.new(bar_index, tpLabelPrice, text  = tpLvlText + "  " + tpReturnStr + "  $" + fmt2(tpLabelPrice), xloc  = xloc.bar_index, style = label.style_label_right, color = color.new(i_tpLabelColor, 20), textcolor = color.white, size  = size.small)
+
+if trimSignal and i_showTrimLabel and i_chartStyle == "Classic"
+    trimReturnStr = not na(trimLastPct) ? formatSignedPct(trimLastPct) : ""
+    label.new(bar_index, trimLastPrice, text = "TRIM -" + fmt2(i_trimFraction) + "%\n" + trimReturnStr + "\n$" + fmt2(trimLastPrice), xloc = xloc.bar_index, style = label.style_label_right, color = color.new(i_trimLabelColor, 20), textcolor = color.white, size = size.small)
+
+// ─────────────────────────────────────────────────────────────
+// SLIM MODE DOTS — precision-sized/positioned plot circles, adjustable via settings
+// ─────────────────────────────────────────────────────────────
+_slimBelow = close <= fairPriceSmooth
+float entryDotVal = (i_chartStyle != "Classic" and newTradeSignal and i_showBuyLabel) ? (_slimBelow ? low - atrTrail * i_slimDotDistance : high + atrTrail * i_slimDotDistance) : na
+color entryDotColor = i_buyCol
+float addDotVal   = (i_chartStyle != "Classic" and reEntrySignal and i_showReEntryLabel) ? (_slimBelow ? low - atrTrail * i_slimDotDistance : high + atrTrail * i_slimDotDistance) : na
+float exitDotVal  = (i_chartStyle != "Classic" and exitTradeSignal and i_showSellLabel) ? (_slimBelow ? low - atrTrail * i_slimDotDistance : high + atrTrail * i_slimDotDistance) : na
+float tpDotVal    = (i_chartStyle != "Classic" and partialTpSignal and i_showTPLabels) ? high + atrTrail * i_slimDotDistance : na
+float trimDotVal  = (i_chartStyle != "Classic" and trimSignal and i_showTrimLabel) ? low - atrTrail * i_slimDotDistance : na
+
+plot(entryDotVal, "Entry dot (Slim)", style = plot.style_circles, color = entryDotColor, linewidth = i_slimDotSize)
+plot(addDotVal, "Add dot (Slim)", style = plot.style_circles, color = i_reEntryCol, linewidth = i_slimDotSize)
+plot(exitDotVal, "Exit dot (Slim)", style = plot.style_circles, color = i_sellCol, linewidth = i_slimDotSize)
+plot(tpDotVal, "TP dot (Slim)", style = plot.style_circles, color = i_tpLabelColor, linewidth = i_slimDotSize)
+plot(trimDotVal, "Trim dot (Slim)", style = plot.style_circles, color = i_trimLabelColor, linewidth = i_slimDotSize)
+
+metricBarColor = close < pivotBandDown2 ? color.blue : close < pivotBandDown ? color.rgb(124, 147, 239) : close < fairPriceSmooth ? color.aqua : close <= pivotBandUp ? color.yellow : close <= pivotBandUp2 ? color.orange : color.red
+positionBarColor = inTrade ? color.new(color.green, 0) : color.new(color.red, 0)
+barcolor(i_colorCandlesByPosition ? na : i_btCheck ? metricBarColor : na)   // barcolor kept only for the metric-highlight feature now
+plotcandle(i_colorCandlesByPosition ? open : na, high, low, close, title = "Position-colored candles", color = positionBarColor, wickcolor = positionBarColor, bordercolor = positionBarColor, display = display.all - display.status_line)
+
+crossFunc(src, crossType, crossRef) =>
+    crossRefConv = switch crossRef
+        "+1" => pivotBandUp
+        "+2" => pivotBandUp2
+        "+3" => pivotBandUp3
+        "-1" => pivotBandDown
+        "-2" => pivotBandDown2
+        =>      pivotBandDown3
+    cross = crossType == "Above" ? ta.crossover(src, crossRefConv) : ta.crossunder(src, crossRefConv)
+    crossTxt = crossType == "Above" ? crossRef + "\n▼" : "▲\n" + crossRef
+    crossPos = crossType == "Above" ? label.style_label_down : label.style_label_up
+    crossLoc = crossType == "Above" ? high : low
+    crossCol = crossType == "Above" ? i_crossAboveCol : i_crossBelowCol
+    if cross
+        label.new(bar_index, crossLoc, text = crossTxt, style = crossPos, textcolor = crossCol, color = color.new(color.aqua, 100), size = size.normal)
+
+if i_crossRef1 != "Off"
+    crossFunc(i_crossSrc1, i_crossMethod1, i_crossRef1)
+if i_crossRef2 != "Off"
+    crossFunc(i_crossSrc2, i_crossMethod2, i_crossRef2)
+if i_crossRef3 != "Off"
+    crossFunc(i_crossSrc3, i_crossMethod3, i_crossRef3)
+if i_crossRef4 != "Off"
+    crossFunc(i_crossSrc4, i_crossMethod4, i_crossRef4)
+
+// ─────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────
+alertcondition(newTradeSignal, "BUY Signal", "BUY signal triggered.")
+alertcondition(apbArmed and apbArmWeeks == 0, "AdaptivePB Armed", "Signal fired — now waiting for pullback to the armed price. Check the chart for the exact level.")
+alertcondition(newTradeSignal and useAdaptiveEntry, "AdaptivePB Filled", "Position entered — check the ENTRY label on the chart for fill type (Pullback / Fallback / Immediate).")
+alertcondition(reEntrySignal, "RE-ENTRY Signal", "Pullback re-entry episode fired.")
+alertcondition(exitTradeSignal, "SELL Signal", "SELL signal triggered.")
+alertcondition(partialTpSignal, "Partial TP Signal", "Partial TP hit.")
+alertcondition(trimSignal, "DON Trim Signal", "DON Trim partial exit fired.")
+alertcondition(atrStopHit, "ATR Trail Exit", "ATR trailing stop hit.")
+alertcondition(weeklyStructureBreak, "Weekly Structure Exit", "Weekly structure exit triggered.")
+alertcondition(newTradeSignal or reEntrySignal or exitTradeSignal, "BUY / RE-ENTRY / SELL", "Combined signal.")
