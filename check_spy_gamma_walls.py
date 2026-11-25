@@ -51,11 +51,17 @@ def main(ticker="SPY"):
         ch = tk.option_chain(exp)
         used.append(exp)
         for side, df, sign in (("C", ch.calls, 1), ("P", ch.puts, -1)):
+            # Pre-market, Yahoo often reports junk IVs (~0) -- fall back to the
+            # median sane IV of this expiry/side, else a flat 20%.
+            sane = df["impliedVolatility"][(df["impliedVolatility"] > 0.03) & (df["impliedVolatility"] < 3)]
+            fallback_iv = float(sane.median()) if len(sane) else 0.20
             for _, r in df.iterrows():
                 oi = r.get("openInterest")
                 iv = r.get("impliedVolatility")
-                if pd.isna(oi) or pd.isna(iv) or oi <= 0 or iv < 0.01:
+                if pd.isna(oi) or oi <= 0:
                     continue
+                if pd.isna(iv) or iv < 0.03 or iv > 3:
+                    iv = fallback_iv
                 g = bs_gamma(spot, float(r["strike"]), T, float(iv))
                 gex = sign * g * oi * 100 * spot * spot * 0.01
                 rows.append({"exp": exp, "side": side, "strike": float(r["strike"]),
