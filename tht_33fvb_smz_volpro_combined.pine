@@ -43,16 +43,26 @@
 // ([A1]-[A6] for FVB, [A1]-[A4] for SMZ) — same assumptions apply here,
 // unchanged.
 //
-// [v20] Added "My Position" manual entry/stop marker (grpMine, below Module
-// 1's visuals): two inputs (entry date + entry price) plus an optional stop
-// price, drawn by the script itself via label.new/line.new -- comes out of
-// this indicator's OWN max_labels_count/max_lines_count budget, NOT
-// TradingView's free-plan 30-drawing cap on manually-placed Drawing Tools.
-// Set per chart/symbol in the indicator's own settings instead of drawing
-// anything by hand. Purely additive/cosmetic: reads no Module 1 state,
-// writes nothing Module 1 reads -- cannot affect Trades/Win%/PF/etc.
+// [v20] Added "My Position" manual entry/stop marker: input fields for an
+// entry date/price plus an optional stop, drawn via label.new/line.new.
+// SUPERSEDED in v21 below -- on this account/device, TradingView did not
+// keep those input values separate per chart: entering NVDA's price on the
+// NVDA chart also showed it on a separately-saved BTCUSDC chart (confirmed
+// live, 2026-11-25). Manual per-chart inputs for this are not safe to use.
+//
+// [v21] Replaced with a fixed table of open positions baked directly into
+// the script SOURCE (not an input field), keyed by symbol (syminfo.ticker).
+// A chart only ever draws a marker if ITS OWN symbol matches a row in the
+// table -- there is no input value to carry between charts, so nothing can
+// leak. The table is regenerated from my_positions.csv by
+// gen_my_positions_pine.py and this file re-pasted into TradingView
+// whenever a position opens or closes. Still purely additive/cosmetic:
+// reads no Module 1 state, writes nothing Module 1 reads -- cannot affect
+// Trades/Win%/PF/etc. Still comes out of this indicator's OWN
+// max_labels_count/max_lines_count budget, not TradingView's free-plan
+// 30-drawing cap on manually-placed Drawing Tools.
 // =============================================================================
-indicator("THT 33FVB / SMZ / Volume Pro [Combined] v20", shorttitle="FVBSMZVol-v20", overlay=true, max_labels_count=500, max_boxes_count=750, max_lines_count=500)
+indicator("THT 33FVB / SMZ / Volume Pro [Combined] v21", shorttitle="FVBSMZVol-v21", overlay=true, max_labels_count=500, max_boxes_count=750, max_lines_count=500)
 
 // =============================================================================
 // MODULE SWITCH
@@ -88,22 +98,12 @@ showMarkers = input.bool(true, "Show entry/exit markers", group=grpV)
 showPosBG   = input.bool(true, "Position background", group=grpV)
 bgOpacity   = input.int(90, "BG opacity", minval=0, maxval=100, group=grpV)
 
-// [v20] Manual entry/stop marker — draws YOUR actual filled entry (and,
-// optionally, your stop) directly from the indicator, via label.new/
-// line.new. These come out of this script's OWN max_labels_count/
-// max_lines_count budget (set in the indicator() call above), completely
-// separate from TradingView's free-plan 30-drawing cap on manually-placed
-// Drawing Tools -- so you can mark every open position across every
-// symbol without ever touching that limit. Set once per chart/symbol in
-// this indicator's own settings, same as any other input here; nothing
-// to draw by hand. Purely cosmetic -- reads no Module 1 state and writes
-// nothing Module 1 reads, so it can never affect Trades/Win%/PF/etc.
-grpMine = "My Position (entry/stop marker)"
-showMyEntry  = input.bool(false, "Show my entry marker", group=grpMine)
-myEntryDate  = input.time(timestamp("2026-01-01 00:00"), "Entry date", group=grpMine)
-myEntryPrice = input.float(0.0, "Entry price", minval=0.0, step=0.01, group=grpMine)
-showMyStop   = input.bool(false, "Show my stop line", group=grpMine)
-myStopPrice  = input.float(0.0, "Stop price", minval=0.0, step=0.01, group=grpMine)
+// [v21] My open positions — fixed table baked into the source (see note at
+// the top of the file for why this replaced per-chart inputs), regenerated
+// by gen_my_positions_pine.py from my_positions.csv. Only the row matching
+// THIS chart's own symbol ever draws here.
+grpMine = "My Position (auto, from position log)"
+showMyPositions = input.bool(true, "Show my open-position markers", group=grpMine)
 
 grpD = "33FVB: Dashboard"
 showDash = input.bool(true, "Show stats dashboard", group="Module switch")
@@ -470,31 +470,64 @@ fill(pUp, pLo, color = showBandsTop ? color.new(isGreen ? color.green : color.re
 
 bgcolor(showPosBG and inPos ? color.new(color.green, bgOpacity) : na)
 
-// --------------------- [v20] MY POSITION MARKER (manual) --------------------
-// Draws once, on the first bar at/after myEntryDate, then extends right
-// forever via extend.right -- no per-bar redraw needed, no drawing-tool
-// slot used. Independent var state per line/label so toggling either
-// checkbox off removes just that one.
-var bool myEntryDrawn = false
-if showMyEntry and myEntryPrice > 0 and not myEntryDrawn and time >= myEntryDate
-    entryTxt = "YOUR ENTRY  " + str.tostring(myEntryPrice, format.mintick)
-             + "\n" + str.format("{0,date,yyyy-MM-dd}", myEntryDate)
-    label.new(bar_index, myEntryPrice, entryTxt, style = label.style_label_right,
-         color = color.new(color.blue, 0), textcolor = color.white, size = size.small)
-    line.new(bar_index, myEntryPrice, bar_index, myEntryPrice,
-         extend = extend.right, color = color.new(color.blue, 0),
-         style = line.style_solid, width = 2)
-    myEntryDrawn := true
+// --------------------- [v21] MY POSITIONS (auto, symbol-keyed) --------------
+// Fixed table, one row per currently open position, regenerated by
+// gen_my_positions_pine.py from my_positions.csv -- see AUTO-POSITIONS
+// markers below. Only drawn on the chart whose OWN symbol (syminfo.ticker)
+// matches a row, so nothing can show up on the wrong chart: there is no
+// input value here for TradingView to carry between charts.
+var string[] __posTicker = array.new<string>()
+var float[]  __posEntry  = array.new<float>()
+var int[]    __posDate   = array.new<int>()
+var float[]  __posStop   = array.new<float>()
 
-var bool myStopDrawn = false
-if showMyStop and myStopPrice > 0 and not myStopDrawn and time >= myEntryDate
-    stopTxt = "YOUR STOP  " + str.tostring(myStopPrice, format.mintick)
-    label.new(bar_index, myStopPrice, stopTxt, style = label.style_label_right,
-         color = color.new(color.red, 0), textcolor = color.white, size = size.small)
-    line.new(bar_index, myStopPrice, bar_index, myStopPrice,
-         extend = extend.right, color = color.new(color.red, 0),
-         style = line.style_dashed, width = 1)
-    myStopDrawn := true
+if barstate.isfirst
+    // AUTO-POSITIONS-BEGIN
+    array.push(__posTicker, "LMT"), array.push(__posEntry, 513.0000), array.push(__posDate, timestamp("2026-07-20 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "HCA"), array.push(__posEntry, 378.5000), array.push(__posDate, timestamp("2026-07-20 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "EQT"), array.push(__posEntry, 49.9100), array.push(__posDate, timestamp("2026-07-20 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "NOC"), array.push(__posEntry, 531.5000), array.push(__posDate, timestamp("2026-07-20 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "QCOM"), array.push(__posEntry, 168.1600), array.push(__posDate, timestamp("2026-07-27 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "ORLY"), array.push(__posEntry, 90.4000), array.push(__posDate, timestamp("2026-07-27 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "NXPI"), array.push(__posEntry, 225.8600), array.push(__posDate, timestamp("2026-08-03 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "BKE"), array.push(__posEntry, 43.3100), array.push(__posDate, timestamp("2026-09-02 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "FELE"), array.push(__posEntry, 98.6300), array.push(__posDate, timestamp("2026-09-02 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "LIN"), array.push(__posEntry, 488.8200), array.push(__posDate, timestamp("2026-09-02 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "HWKN"), array.push(__posEntry, 127.6100), array.push(__posDate, timestamp("2026-09-25 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "SAH"), array.push(__posEntry, 60.4800), array.push(__posDate, timestamp("2026-09-25 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "SO"), array.push(__posEntry, 82.5000), array.push(__posDate, timestamp("2026-09-25 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "TDS"), array.push(__posEntry, 33.5600), array.push(__posDate, timestamp("2026-10-19 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "SCHW"), array.push(__posEntry, 92.9600), array.push(__posDate, timestamp("2026-11-09 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "FANG"), array.push(__posEntry, 183.1300), array.push(__posDate, timestamp("2026-11-09 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "BOH"), array.push(__posEntry, 70.6700), array.push(__posDate, timestamp("2026-11-09 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "VSEC"), array.push(__posEntry, 184.4700), array.push(__posDate, timestamp("2026-11-09 00:00")), array.push(__posStop, na)
+    array.push(__posTicker, "NVDA"), array.push(__posEntry, 142.6800), array.push(__posDate, timestamp("2026-11-25 00:00")), array.push(__posStop, na)
+    // AUTO-POSITIONS-END
+    na
+
+var bool __myDrawn = false
+if showMyPositions and not __myDrawn
+    for i = 0 to array.size(__posTicker) - 1
+        if str.upper(syminfo.ticker) == array.get(__posTicker, i)
+            ep = array.get(__posEntry, i)
+            ed = array.get(__posDate, i)
+            sp = array.get(__posStop, i)
+            if time >= ed
+                entryTxt = "YOUR ENTRY  " + str.tostring(ep, format.mintick)
+                         + "\n" + str.format("{0,date,yyyy-MM-dd}", ed)
+                label.new(bar_index, ep, entryTxt, style = label.style_label_right,
+                     color = color.new(color.blue, 0), textcolor = color.white, size = size.small)
+                line.new(bar_index, ep, bar_index, ep,
+                     extend = extend.right, color = color.new(color.blue, 0),
+                     style = line.style_solid, width = 2)
+                if not na(sp) and sp > 0
+                    stopTxt = "YOUR STOP  " + str.tostring(sp, format.mintick)
+                    label.new(bar_index, sp, stopTxt, style = label.style_label_right,
+                         color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+                    line.new(bar_index, sp, bar_index, sp,
+                         extend = extend.right, color = color.new(color.red, 0),
+                         style = line.style_dashed, width = 1)
+                __myDrawn := true
 
 // =============================================================================
 // MODULE 2: SMART MONEY ZONES  (toggle: showSMZ)
