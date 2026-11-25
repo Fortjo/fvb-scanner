@@ -73,6 +73,16 @@ def main(ticker="SPY"):
         print("No option data returned.")
         return
 
+    for s in ("C", "P"):
+        sub = df[df.side == s]
+        print(f"[diag] side {s}: {len(sub)} rows, OI sum {sub.oi.sum():,}, "
+              f"gex NaN {sub.gex.isna().sum()}, gex sum {sub.gex.sum()/1e9:+.2f}B")
+    df = df.dropna(subset=["gex"])
+    if (df.side == "P").sum() == 0:
+        print("[diag] no usable put rows -- raw sample of first expiry puts:")
+        print(tk.option_chain(used[0]).puts.head(8).to_string())
+        return
+
     by = df.groupby(["side", "strike"]).agg(gex=("gex", "sum"), oi=("oi", "sum")).reset_index()
     calls = by[by.side == "C"]
     puts = by[by.side == "P"]
