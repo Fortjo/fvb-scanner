@@ -1,0 +1,32 @@
+name: Gamma Log (daily options-positioning record, research only)
+
+# Runs during US market hours (Yahoo blanks options open interest outside
+# them). 19:23 UTC = 21:23 Sofia winter / 22:23 summer = 14:23 / 15:23 New York.
+on:
+  schedule:
+    - cron: '23 19 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  log:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy
+      - name: Record today's gamma levels
+        run: python gamma_log.py
+      - name: Commit the log
+        run: |
+          git config user.name "gamma-log-bot"
+          git config user.email "actions@github.com"
+          git add gamma_log.csv 2>/dev/null || exit 0
+          git diff --cached --quiet && exit 0
+          git commit -m "gamma log $(date -u +%F)"
+          for i in 1 2 3; do git pull --rebase -q && git push -q && break; sleep 5; done
