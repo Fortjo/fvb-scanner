@@ -34,7 +34,48 @@ def bs_gamma(S, K, T, iv):
     return math.exp(-0.5 * d1 * d1) / math.sqrt(2 * math.pi) / (S * iv * math.sqrt(T))
 
 
+def load_cboe(ticker):
+    """CBOE's free delayed-quotes feed: OI, IV and gamma per contract, and
+    unlike Yahoo it keeps open interest populated outside US market hours."""
+    import json, re, urllib.request
+    url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker}.json"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    data = json.load(urllib.request.urlopen(req, timeout=30))["data"]
+    spot = float(data.get("current_price") or data.get("close"))
+    now = datetime.now(timezone.utc)
+    rows, exps = [], set()
+    pat = re.compile(rf"^{ticker}(\d{{6}})([CP])(\d{{8}})$")
+    for o in data["options"]:
+        m = pat.match(o["option"])
+        if not m:
+            continue
+        exp = datetime.strptime(m.group(1), "%y%m%d").replace(hour=21, tzinfo=timezone.utc)
+        days = (exp - now).total_seconds() / 86400
+        if days < 0 or days > MAX_DAYS:
+            continue
+        oi = o.get("open_interest") or 0
+        if oi <= 0:
+            continue
+        strike = int(m.group(3)) / 1000
+        g = o.get("gamma") or 0
+        if not g:
+            g = bs_gamma(spot, strike, max(days, 0.25) / 365, o.get("iv") or 0.20)
+        sign = 1 if m.group(2) == "C" else -1
+        exps.add(exp.strftime("%Y-%m-%d"))
+        rows.append({"exp": exp.strftime("%Y-%m-%d"), "side": m.group(2), "strike": strike,
+                     "oi": int(oi), "gex": sign * g * oi * 100 * spot * spot * 0.01})
+    return spot, pd.DataFrame(rows), sorted(exps)
+
+
 def main(ticker="SPY"):
+    try:
+        spot, df, used = load_cboe(ticker)
+        print(f"Source: CBOE delayed quotes. {ticker} spot ~ {spot:.2f}")
+        print(f"Expirations used ({len(used)}): {', '.join(used)}")
+        if not df.empty:
+            return report(df, spot, ticker)
+    except Exception as e:
+        print(f"CBOE feed failed ({e!r}); falling back to Yahoo")
     tk = yf.Ticker(ticker)
     spot = float(tk.history(period="5d")["Close"].iloc[-1])
     now = datetime.now(timezone.utc)
@@ -72,15 +113,17 @@ def main(ticker="SPY"):
     if df.empty:
         print("No option data returned.")
         return
+    report(df, spot, ticker, tk, used)
 
+
+def report(df, spot, ticker, tk=None, used=None):
     for s in ("C", "P"):
         sub = df[df.side == s]
         print(f"[diag] side {s}: {len(sub)} rows, OI sum {sub.oi.sum():,}, "
               f"gex NaN {sub.gex.isna().sum()}, gex sum {sub.gex.sum()/1e9:+.2f}B")
     df = df.dropna(subset=["gex"])
     if (df.side == "P").sum() == 0:
-        print("[diag] no usable put rows -- raw sample of first expiry puts:")
-        print(tk.option_chain(used[0]).puts.head(8).to_string())
+        print("[diag] no usable put rows")
         return
 
     by = df.groupby(["side", "strike"]).agg(gex=("gex", "sum"), oi=("oi", "sum")).reset_index()
