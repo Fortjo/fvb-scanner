@@ -568,7 +568,7 @@ if showMyPositions and not __myDrawn
             ep = array.get(__posEntry, i)
             ed = array.get(__posDate, i)
             sp = array.get(__posStop, i)
-            if time >= ed
+            if time_close >= ed   // the candle that CONTAINS the entry date (weekly/monthly too)
                 entryTxt = "YOUR ENTRY  " + str.tostring(ep, format.mintick)
                          + "\n" + str.format("{0,date,yyyy-MM-dd}", ed)
                 label.new(bar_index, ep, entryTxt, style = label.style_label_right,
