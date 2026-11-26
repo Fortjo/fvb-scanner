@@ -48,7 +48,18 @@ def bs_gamma(S, K, T, iv):
 
 def compute(ticker: str, now: datetime) -> dict | None:
     tk = yf.Ticker(ticker)
-    spot = float(tk.history(period="5d")["Close"].iloc[-1])
+    hist = tk.history(period="5d")
+    spot = float(hist["Close"].dropna().iloc[-1]) if not hist["Close"].dropna().empty else float("nan")
+    if not (spot > 0):
+        # fast_info is a different Yahoo endpoint -- try it before giving up
+        try:
+            spot = float(tk.fast_info["last_price"])
+        except Exception:
+            pass
+    if not (spot > 0):
+        print(f"{ticker}: no valid spot price (history tail: "
+              f"{hist['Close'].tail(3).to_dict() if not hist.empty else 'EMPTY'}) -- skipped")
+        return None
     rows = []
     for exp in tk.options:
         exp_dt = datetime.strptime(exp, "%Y-%m-%d").replace(hour=21, tzinfo=timezone.utc)
