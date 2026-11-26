@@ -45,10 +45,11 @@
 //
 // [v20] Added "My Position" manual entry/stop marker: input fields for an
 // entry date/price plus an optional stop, drawn via label.new/line.new.
-// SUPERSEDED in v21 below -- on this account/device, TradingView did not
-// keep those input values separate per chart: entering NVDA's price on the
-// NVDA chart also showed it on a separately-saved BTCUSDC chart (confirmed
-// live, 2026-11-25). Manual per-chart inputs for this are not safe to use.
+// SUPERSEDED in v21 below -- entering NVDA's price also showed it on
+// BTCUSDC (2026-11-25). Cause found 2026-11-26: the account has only ONE
+// chart layout ("Unnamed"), and changing symbol inside a layout keeps the
+// same indicator instance and its inputs. So per-chart inputs can't hold
+// different positions for different symbols on this setup.
 //
 // [v21] Replaced with a fixed table of open positions baked directly into
 // the script SOURCE (not an input field), keyed by symbol (syminfo.ticker).
@@ -61,8 +62,13 @@
 // Trades/Win%/PF/etc. Still comes out of this indicator's OWN
 // max_labels_count/max_lines_count budget, not TradingView's free-plan
 // 30-drawing cap on manually-placed Drawing Tools.
+//
+// [v22] Added an optional comparison overlay of Peter's new "THT Smart
+// Money Bands" (20-period EMA of monthly OHLC4 + our median-deviation zone
+// around it), toggle "Show Peter's 20-EMA Smart Money Band" in Module
+// switch, off by default. Display only -- Module 1 untouched.
 // =============================================================================
-indicator("THT 33FVB / SMZ / Volume Pro [Combined] v21", shorttitle="FVBSMZVol-v21", overlay=true, max_labels_count=500, max_boxes_count=750, max_lines_count=500)
+indicator("THT 33FVB / SMZ / Volume Pro [Combined] v22", shorttitle="FVBSMZVol-v22", overlay=true, max_labels_count=500, max_boxes_count=750, max_lines_count=500)
 
 // =============================================================================
 // MODULE SWITCH
@@ -70,6 +76,7 @@ indicator("THT 33FVB / SMZ / Volume Pro [Combined] v21", shorttitle="FVBSMZVol-v
 showSMZ = input.bool(true, "Show Smart Money Zones module", group="Module switch")
 showVolProfile = input.bool(true, "Show Volume Profile module", group="Module switch")
 showBandsTop = input.bool(false, "Show FVB bands", group="Module switch")
+showPeterBand = input.bool(false, "Show Peter's 20-EMA Smart Money Band (comparison)", group="Module switch")
 showSMZDiag = input.bool(false, "Show SMZ diagnostic label", group="Module switch", tooltip="Debug readout showing the exact top/low/lastConfirmedHigh values the SMZ zone is using. Leave off unless troubleshooting.")
 showFVBDiag = input.bool(false, "Show FVB diagnostic label", group="Module switch", tooltip="Debug readout showing the current basis/upper/lower band and green/red state, for checking against the Python-validated ORCL flip timeline. Leave off unless troubleshooting.")
 
@@ -357,6 +364,48 @@ if newMonthBar and not na(prevMO) and not na(prevMH) and not na(prevML)
 frac     = bandSel == "High" ? fracHigh : bandSel == "Mid" ? fracMid : fracLow
 entryBnd = bandSel == "High" ? upperB : bandSel == "Low" ? lowerB : basis
 
+// ------------- [v22] PETER'S SMART MONEY BAND (comparison overlay only) ------
+// Reverse-engineered 2026-11-26 from his chart readings (see
+// peter_smart_money_bands_observations.md in the repo): centre = 20-period
+// EMA of monthly OHLC4, zone = the SAME median-deviation band method as our
+// FVB, built around that EMA instead of our 33-period SMA. Matched BE/ARM/
+// AVGO/AAOI/NVDA readings within ~0.1% and his zone edges within ~$3.
+// Display only: separate variables, reads none of Module 1's state and
+// writes nothing Module 1 reads -- Trades/Win%/PF are untouched.
+// Value includes the month in progress (his line moves within the month,
+// stepping at each new month), colour uses completed months only (sticky:
+// red only after a whole month's HIGH closes below the lower edge).
+var float pEmaDone = na                       // EMA through last completed month
+var int   pCount   = 0
+var array<float> pDevUp = array.new_float()
+var array<float> pDevDn = array.new_float()
+var float pMedUp = na
+var float pMedDn = na
+var bool  pGreen = true
+pAlpha = 2.0 / (20 + 1)
+if newMonthBar and not na(prevMO) and not na(prevMH) and not na(prevML)
+    pCompleted = (prevMO + prevMH + prevML + close[1]) / 4
+    pEmaDone := na(pEmaDone) ? pCompleted : pEmaDone + pAlpha * (pCompleted - pEmaDone)
+    pCount += 1
+    if pCount >= 20
+        pStr = prevML < pEmaDone and prevMH > pEmaDone
+        array.push(pDevUp, pStr ? prevMH / pEmaDone : na)
+        array.push(pDevDn, pStr ? prevML / pEmaDone : na)
+        if array.size(pDevUp) > 1000
+            array.shift(pDevUp)
+        if array.size(pDevDn) > 1000
+            array.shift(pDevDn)
+        pMedUp := array.median(pDevUp)
+        pMedDn := array.median(pDevDn)
+        if not na(pMedDn) and prevMH < pEmaDone * pMedDn
+            pGreen := false
+        else if not na(pMedUp) and prevML > pEmaDone * pMedUp
+            pGreen := true
+pCurOhlc4 = (mO + mH + mL + close) / 4
+pCentre = pCount >= 20 and not na(pEmaDone) ? pEmaDone + pAlpha * (pCurOhlc4 - pEmaDone) : na
+pUpper  = na(pCentre) or na(pMedUp) ? na : pCentre * pMedUp
+pLower  = na(pCentre) or na(pMedDn) ? na : pCentre * pMedDn
+
 stopTriggered = false
 if stopDef == "Basis slope flip"
     stopTriggered := not isGreen
@@ -467,6 +516,13 @@ pUp    = plot(showBandsTop ? upperB : na, "FVB upper", color = color.new(color.t
 pLo    = plot(showBandsTop ? lowerB : na, "FVB lower", color = color.new(color.teal, 60))
 plot(showBandsTop ? entryBnd : na, "Entry band", color = color.new(color.orange, 0), style = plot.style_linebr)
 fill(pUp, pLo, color = showBandsTop ? color.new(isGreen ? color.green : color.red, 92) : na)
+
+// [v22] Peter's 20-EMA Smart Money Band -- comparison overlay, off by default
+pColor = pGreen ? color.rgb(38, 222, 166) : color.rgb(240, 80, 80)
+pPC = plot(showPeterBand ? pCentre : na, "Peter SMB centre", color = pColor, linewidth = 2, style = plot.style_stepline)
+pPU = plot(showPeterBand ? pUpper : na, "Peter SMB upper", color = color.new(pColor, 70), style = plot.style_stepline)
+pPL = plot(showPeterBand ? pLower : na, "Peter SMB lower", color = color.new(pColor, 70), style = plot.style_stepline)
+fill(pPU, pPL, color = showPeterBand ? color.new(pColor, 88) : na)
 
 bgcolor(showPosBG and inPos ? color.new(color.green, bgOpacity) : na)
 
