@@ -1,0 +1,56 @@
+# Peter DiCarlo — "THT Smart Money Bands" observations
+
+Research log, started 2026-11-26. Everything here was read directly from his public
+X posts (@pdicarlotrader). It is observation, not his official documentation.
+
+## Status of his indicators
+- 2026-11-26: a user replied that "the THT fair value band stopped working on TradingView".
+  Peter: "We have updated the indicator and made it better. It's also now only for our
+  private academy members." The public 33FVB is gone; our own copy in this repo
+  (tht_33fvb_smz_volpro_combined.pine) is unaffected.
+- The private "Combined Signal System" (used for his fund) and the multi-timeframe BX
+  (monthly BX drawn over the weekly chart) have been members-only since at least Feb 2026.
+
+## Chart readings (indicator value printed on his chart)
+| date (chart) | ticker | chart TF | reading | notes |
+|---|---|---|---|---|
+| 2026-11-25 | BE   | 1W | 161.25 | stepped (monthly) green band |
+| 2026-11-25 | ARM  | 1W | 198.45 | stepped |
+| 2026-11-25 | AVGO | 1M | 321.49 | |
+| 2026-11-25 | AAOI | 1W | 76.01  | |
+| 2026-11-22 (data to 11-20) | SMH | 1W | 431.23 | stepped monthly band, green |
+| 2026-11-22 (data to 11-20) | SMH | 1W | 537.72 | second, smooth (weekly) band, RED (price below, falling) |
+
+## Reverse-engineered formula (check_smart_money_band_hypothesis.py)
+Centre line = **20-period EMA of OHLC4**, monthly (stepped) or weekly (smooth).
+Fitted on BE/ARM/AVGO (all within 0.1%); out-of-sample AAOI exact (76.01),
+SMH weekly exact (537.72), SMH monthly +0.7% (likely screenshot timing).
+Unknown: the width of the shaded zone around the line, and how its colour is decided
+(SMH weekly line red while price below and falling — consistent with slope or price vs line).
+
+## Other indicators visible on his charts (SMH, 2026-11-22)
+THT Bull Cycle, SRSI Candles, THT Volume Pro, two THT Smart Money Bands (monthly + weekly),
+THT Multi Timeframe BX (histogram, read -23.18), boxes labelled "Institutional Buy Zone"
+and "Smart Money Zone".
+
+## Rules and claims he stated
+- Monthly BX = "most important indicator to me", then the weekly market bias (2026-01-30).
+- BX only counts as red once the month has closed, not intra-month (2026-03-03).
+- BX "is just an RSI in histogram format" (2026-04-12).
+- 33FVB bands = average of OHLC over the past 33 candles (2026-01-26).
+- Shorter-term BX used inside a bull cycle for entries/exits (2026-07-01); short-term
+  setups only once the long-term setup is in play (2026-04-10).
+- "Bull Cycle Over" = monthly BX turned red (LMND, 2026-04-06).
+- Stops: "multiple weekly closes under the swing low" (META, $520, 2026-11-20);
+  "two weekly closes below $660" (QQQ, 2026-11-22).
+- Monthly Smart Money Band = "strongest support in our long term system", bounces
+  "80% of the time" (BE, 2026-11-25); QQQ level "we never break, except 2008 and 2000".
+
+## Our backtest of the 20-month line (test_ema20_band_system.py, 2026-11-26)
+Same universe/engine/exits as our live 33-month FVB:
+- Our 33-month FVB: 1,851 trades, 71% win, +16.0% avg, PF 3.58; portfolio CAGR 14.4%, max DD -22.6%.
+- 20-month EMA, same band method: 3,136 trades, 79% win, +12.7% avg, PF 3.47; CAGR 13.4%, max DD -30.9%.
+- Touch the 20-month line, EMA-slope stop: 3,425 trades, 58% win, +7.7% avg, PF 2.64; CAGR 14.3%, max DD -31.8%.
+- SPY touches of the 20-month line since 1994: 16 episodes, 7 bounced (his claim 18/20) —
+  the line alone does not reproduce his bounce count; his shaded zone/break rule must differ.
+Verdict: keep the 33-month system; the 20-month line is not better on our engine.
