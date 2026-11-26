@@ -41,3 +41,15 @@ window, and 200 random sets of trades with the same count and the same holding l
 Verdict: on daily stocks, Bottom->Top/Bear timing looks better than random and nearly matches
 buy-hold with a third of the time in the market. Only ~14 months of data in one market period:
 promising, not proven. Not related to the monthly FVB system.
+
+## Timing FVB entries with the daily "Bottom" label (2026-11-26)
+All 81 FVB entries since Oct 2025 (list_recent_fvb_entries.py), real PPS daily labels read from
+TradingView. Rule: after the FVB signal week, wait up to 30 trading days for a daily Bottom and
+buy at that close.
+- 51/81 got a Bottom: entry on average only 0.7% cheaper (median 0.3%), cheaper on 27/51,
+  median wait 8 days -> basically a coin flip.
+- 30/81 got no Bottom within 30 days: those stocks had already run up; entering late cost ~5.7%.
+- Always waiting = on average 1.7% WORSE entries than taking the FVB price.
+- The signals that never gave a Bottom were the better trades (+12.1% to date, 24/30 up) vs
+  +7.7% (33/51 up) for those that did -> skipping no-Bottom signals would drop the best ones.
+Verdict: does not improve FVB entries; take the FVB entry as usual.
