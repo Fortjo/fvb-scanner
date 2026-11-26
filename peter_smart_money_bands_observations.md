@@ -20,13 +20,22 @@ X posts (@pdicarlotrader). It is observation, not his official documentation.
 | 2026-11-25 | AAOI | 1W | 76.01  | |
 | 2026-11-22 (data to 11-20) | SMH | 1W | 431.23 | stepped monthly band, green |
 | 2026-11-22 (data to 11-20) | SMH | 1W | 537.72 | second, smooth (weekly) band, RED (price below, falling) |
+| 2026-11-25 | NVDA | 1W | 180.00 | stepped, green; zone edges read off chart ~198 / ~152; price 144 (below zone, band still green) |
 
 ## Reverse-engineered formula (check_smart_money_band_hypothesis.py)
 Centre line = **20-period EMA of OHLC4**, monthly (stepped) or weekly (smooth).
 Fitted on BE/ARM/AVGO (all within 0.1%); out-of-sample AAOI exact (76.01),
 SMH weekly exact (537.72), SMH monthly +0.7% (likely screenshot timing).
-Unknown: the width of the shaded zone around the line, and how its colour is decided
-(SMH weekly line red while price below and falling — consistent with slope or price vs line).
+**Shaded zone = the same median-deviation band method as our FVB, built around the
+20-EMA instead of the 33-SMA** (check_smart_money_band_zone.py): NVDA ours 199.8 / 155.1
+vs his ~198 / ~152; BE ours 196.9 / 137.3 vs his ~197 / ~137 (his edges read by pixel, +/- ~$3).
+In other words: his new indicator = our FVB with the basis swapped from a 33-period simple
+average to a 20-period exponential average. That is exactly variant A in our backtest.
+
+Colour: consistent with the same sticky rule as our FVB — the band only turns red when a
+whole candle (its high) closes below the lower edge. NVDA traded at 144, below the lower
+edge (~155), and the band was still green; Peter: "If the band closes a month red, I will
+change my outlook" (2026-11-25). For NVDA that needs a full month with its high under ~155.
 
 ## Other indicators visible on his charts (SMH, 2026-11-22)
 THT Bull Cycle, SRSI Candles, THT Volume Pro, two THT Smart Money Bands (monthly + weekly),
@@ -54,3 +63,5 @@ Same universe/engine/exits as our live 33-month FVB:
 - SPY touches of the 20-month line since 1994: 16 episodes, 7 bounced (his claim 18/20) —
   the line alone does not reproduce his bounce count; his shaded zone/break rule must differ.
 Verdict: keep the 33-month system; the 20-month line is not better on our engine.
+(Variant A turned out to be his actual band construction — see zone check above — so this
+is a direct test of his new band with our entry/exit rules, not an approximation.)
