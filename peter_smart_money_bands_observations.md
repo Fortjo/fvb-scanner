@@ -65,3 +65,13 @@ Same universe/engine/exits as our live 33-month FVB:
 Verdict: keep the 33-month system; the 20-month line is not better on our engine.
 (Variant A turned out to be his actual band construction — see zone check above — so this
 is a direct test of his new band with our entry/exit rules, not an approximation.)
+
+## "Silver Bullet" setup (from his posts, Oct-Nov 2026)
+- He calls it "the strongest setup in my entire system" (DELL, 2026-10-27).
+- Charts (TEM 2026-11-02, MDB 2026-11-03) are DAILY: price pulls back into the daily
+  Smart Money Zone (the fib boxes: "Institutional Buy Zone" 0.618-0.786, "Smart Money Zone"
+  0.786-0.826 -- same boxes as our SMZ module) while the long-term bull cycle is on
+  (THT BX Dash showing monthly and weekly BX both positive: TEM 1M +17.5, W +5.9).
+- Short-term target = prior swing high; examples: TEM +25%, OSCR +20%, DELL +11%, AMD and MDB
+  taken into earnings. Exempt from his 5-point fundamentals checklist.
+- Not backtested by us yet.
