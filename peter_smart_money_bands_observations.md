@@ -74,4 +74,15 @@ is a direct test of his new band with our entry/exit rules, not an approximation
   (THT BX Dash showing monthly and weekly BX both positive: TEM 1M +17.5, W +5.9).
 - Short-term target = prior swing high; examples: TEM +25%, OSCR +20%, DELL +11%, AMD and MDB
   taken into earnings. Exempt from his 5-point fundamentals checklist.
-- Not backtested by us yet.
+- Backtested 2026-11-26 (test_silver_bullet.py), 167 large caps, daily 1995-2026, rules fixed in
+  advance (pivots 10/10, zone 0.618-0.826 of last swing, monthly+weekly BX > 0, target prior
+  swing high, stop on a daily close below the swing low):
+  - Silver Bullet: 4,196 trades, 48.5% win, +1.6% avg, PF 1.42, median hold 18 days.
+  - Same rules without the BX filter: 45.3% win, +1.4% avg -- the bull-cycle filter helps a little
+    per trade and halves portfolio drawdown (-28% vs -54%).
+  - Random bull-cycle days with the same target/stop distances: +2.0% avg, PF 1.57 -> the zone
+    timing itself adds no edge beyond the reward:risk geometry.
+  - Portfolio (15 slots): CAGR 11.9%, max DD -28% vs our 33-month FVB 14.4% / -22.6%.
+  - Losing years: 2002, 2008, 2011, 2022, 2026 (so far).
+  Verdict: positive but mediocre, worse than our FVB; not added to the indicator. His own
+  discretion (fundamentals, earnings, chart patterns) is not captured by these rules.
