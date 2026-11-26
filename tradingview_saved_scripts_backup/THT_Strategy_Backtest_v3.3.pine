@@ -1,0 +1,331 @@
+//@version=6
+// THT Strategy Backtest v3 — companion to "Fair Value Bands + B-Xtrender Signals v3"
+// Same signal logic, wrapped in strategy() so TradingView's Strategy Tester can
+// produce equity curve, max drawdown, profit factor, Sharpe, and a full trade list.
+//
+// Realism defaults: 0.1% commission per side, orders filled on bar close.
+// Toggle the filters on/off to measure what each one contributes.
+strategy("THT Strategy Backtest v3",
+     overlay = true,
+     initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 100,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.1,
+     process_orders_on_close = false,
+     calc_on_every_tick = false)
+
+// ─────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────
+groupMode = "Strategy Mode"
+i_strategyMode = input.string("Classic (BX + FVB)", "Strategy mode", options = ["Classic (BX + FVB)", "Weekly DON BX"], group = groupMode)
+
+groupDate = "Backtest Window"
+i_useDateRange = input.bool(false, "Limit to date range", group = groupDate)
+i_startDate    = input.time(timestamp("1 Jan 2016"), "Start", group = groupDate)
+i_endDate      = input.time(timestamp("1 Jan 2030"), "End", group = groupDate)
+
+groupVol = "Volatility Filter"
+i_useVolFilter = input.bool(true, "Require minimum daily volatility", group = groupVol)
+i_volMinPct    = input.float(3.0, "Min avg daily move %", group = groupVol, minval = 0.1, step = 0.1)
+i_volLookback  = input.int(21, "Lookback (trading days)", group = groupVol, minval = 5, maxval = 120)
+
+groupRegime = "Market Regime Filter (SPY 200MA)"
+i_useRegime         = input.bool(true, "Only enter when market is risk-on", group = groupRegime)
+i_regimeSymbol      = input.symbol("AMEX:SPY", "Index symbol", group = groupRegime)
+i_regimeMaLen       = input.int(200, "Daily SMA length", group = groupRegime, minval = 50, maxval = 400)
+i_regimeConfirmDays = input.int(3, "Confirmation days above MA", group = groupRegime, minval = 1, maxval = 20)
+
+groupPB = "Pullback Entry"
+i_entryMode     = input.string("Immediate", "Entry mode", options = ["Immediate", "Wait for pullback"], group = groupPB, tooltip = "Wait for pullback: instead of buying at the signal close, place a limit order below it and wait. The one entry modification validated in the 10y backtest (~85% fill rate, improved CAGR). Directly targets buying at the end of a strong week.")
+i_pbPct         = input.float(7.0, "Pullback % below signal price", group = groupPB, minval = 1, maxval = 25, step = 0.5)
+i_pbExpiryWeeks = input.int(8, "Cancel after N weeks unfilled", group = groupPB, minval = 1, maxval = 52)
+i_pbFallback    = input.bool(false, "Enter at market on expiry if signal still valid", group = groupPB)
+i_pbDebugNoCancel = input.bool(false, "DEBUG: never auto-cancel (isolates fill mechanics)", group = groupPB, tooltip = "Temporary diagnostic. When on, the armed order is never cancelled by expiry or invalidation — it only resolves by filling or by a normal sell signal. Use this to test whether limit orders can fill at all in this setup.")
+
+groupPanel = "Status Panel"
+i_showPanel = input.bool(true, "Show status panel", group = groupPanel)
+i_panelSize = input.int(2, "Panel size", group = groupPanel, minval = 1, maxval = 5)
+i_panelPos  = input.string("Top right", "Panel position", options = ["Top right","Bottom right","Bottom left","Top left"], group = groupPanel)
+
+groupFair1 = "Fair Value Basis & Bands"
+i_boost               = input.float(1, "Threshold band width", group = groupFair1, step = 0.10, minval = 0)
+i_sourceString        = input.string("OHLC4", "Source", options = ["OHLC4","Open","High","Low","Close","HL2","HLC3","HLCC4"], group = groupFair1)
+i_smoothingType       = input.string("SMA", "Smoothing", options = ["SMA","EMA","HMA","RMA","WMA","VWMA","Median"], group = groupFair1)
+i_length              = input.int(33, "Length", group = groupFair1, minval = 1)
+i_trendMode           = input.string("Cross", "Trend mode", options = ["Cross","Direction"], group = groupFair1)
+i_thresholdUpString   = input.string("Low", "Threshold up source", options = ["OHLC4","Open","High","Low","Close","HL2","HLC3","HLCC4"], group = groupFair1)
+i_thresholdDownString = input.string("High", "Threshold down source", options = ["OHLC4","Open","High","Low","Close","HL2","HLC3","HLCC4"], group = groupFair1)
+
+groupBX  = "B-Xtrender (Monthly)"
+short_l1 = input.int(5,  "Short - L1", group = groupBX)
+short_l2 = input.int(20, "Short - L2", group = groupBX)
+short_l3 = input.int(5,  "Short - L3", group = groupBX)
+
+groupDon  = "Donchian BX (Weekly)"
+i_donL1   = input.int(5,  "Short - L1", group = groupDon)
+i_donL2   = input.int(20, "Short - L2", group = groupDon)
+i_donL3   = input.int(5,  "Smoothing - L3", group = groupDon)
+
+groupRules = "Rule Filters (Classic mode)"
+i_useBxRule  = input.bool(true, "Use BX rule",  group = groupRules)
+i_useFvbRule = input.bool(true, "Use FVB rule", group = groupRules)
+
+// ─────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────
+stringSrc(source) =>
+    if source == "Open"
+        open
+    else if source == "High"
+        high
+    else if source == "Low"
+        low
+    else if source == "Close"
+        close
+    else if source == "HL2"
+        hl2
+    else if source == "HLC3"
+        hlc3
+    else if source == "HLCC4"
+        hlcc4
+    else
+        ohlc4
+
+donMid(len) =>
+    (ta.highest(high, len) + ta.lowest(low, len)) / 2.0
+
+i_source           = stringSrc(i_sourceString)
+i_thresholdUpSrc   = stringSrc(i_thresholdUpString)
+i_thresholdDownSrc = stringSrc(i_thresholdDownString)
+
+smoothedValue(source, length) =>
+    if i_smoothingType == "SMA"
+        ta.sma(source, length)
+    else if i_smoothingType == "EMA"
+        ta.ema(source, length)
+    else if i_smoothingType == "HMA"
+        ta.hma(source, length)
+    else if i_smoothingType == "RMA"
+        ta.rma(source, length)
+    else if i_smoothingType == "VWMA"
+        ta.vwma(source, length)
+    else if i_smoothingType == "Median"
+        ta.median(source, length)
+    else
+        ta.wma(source, length)
+
+fairPriceSmooth = smoothedValue(i_source, i_length)
+
+// ─────────────────────────────────────────────────────────────
+// FVB DEVIATIONS (chart TF, feeds the weekly band width)
+// ─────────────────────────────────────────────────────────────
+lowSpread     = low  / fairPriceSmooth
+highSpread    = high / fairPriceSmooth
+deviationDown = low < fairPriceSmooth and high > fairPriceSmooth ? lowSpread  : na
+deviationUp   = low < fairPriceSmooth and high > fairPriceSmooth ? highSpread : na
+
+var deviationUpList   = array.new_float()
+var deviationDownList = array.new_float()
+
+if array.size(deviationUpList) > 1000
+    array.remove(deviationUpList, 0)
+if array.size(deviationDownList) > 1000
+    array.remove(deviationDownList, 0)
+
+if not na(deviationUp)
+    array.push(deviationUpList, deviationUp)
+if not na(deviationDown)
+    array.push(deviationDownList, deviationDown)
+
+medianUpDeviation   = array.size(deviationUpList) > 0 ? array.median(deviationUpList) : 1.01
+medianDownDeviation = array.size(deviationDownList) > 0 ? array.median(deviationDownList) : 0.99
+
+// ─────────────────────────────────────────────────────────────
+// WEEKLY FVB (bull cycle component)
+// ─────────────────────────────────────────────────────────────
+srcForWeekly = stringSrc(i_sourceString)
+
+fvb_basis_w = switch i_smoothingType
+    "SMA"    => request.security(syminfo.tickerid, "W", ta.sma(srcForWeekly, i_length),    lookahead = barmerge.lookahead_off)
+    "EMA"    => request.security(syminfo.tickerid, "W", ta.ema(srcForWeekly, i_length),    lookahead = barmerge.lookahead_off)
+    "HMA"    => request.security(syminfo.tickerid, "W", ta.hma(srcForWeekly, i_length),    lookahead = barmerge.lookahead_off)
+    "RMA"    => request.security(syminfo.tickerid, "W", ta.rma(srcForWeekly, i_length),    lookahead = barmerge.lookahead_off)
+    "WMA"    => request.security(syminfo.tickerid, "W", ta.wma(srcForWeekly, i_length),    lookahead = barmerge.lookahead_off)
+    "VWMA"   => request.security(syminfo.tickerid, "W", ta.vwma(srcForWeekly, i_length),   lookahead = barmerge.lookahead_off)
+    "Median" => request.security(syminfo.tickerid, "W", ta.median(srcForWeekly, i_length), lookahead = barmerge.lookahead_off)
+    =>          request.security(syminfo.tickerid, "W", ta.sma(srcForWeekly, i_length),    lookahead = barmerge.lookahead_off)
+
+fvb_threshUpSrc_w = request.security(syminfo.tickerid, "W", stringSrc(i_thresholdUpString), lookahead = barmerge.lookahead_off)
+fvb_threshDnSrc_w = request.security(syminfo.tickerid, "W", stringSrc(i_thresholdDownString), lookahead = barmerge.lookahead_off)
+
+fvb_upperBoosted_w = fvb_basis_w + (fvb_basis_w * medianUpDeviation   - fvb_basis_w) * i_boost
+fvb_lowerBoosted_w = fvb_basis_w - (fvb_basis_w - fvb_basis_w * medianDownDeviation) * i_boost
+
+fvb_trendRuleUp_w   = i_trendMode == "Cross" ? fvb_threshUpSrc_w > fvb_upperBoosted_w : fvb_basis_w > fvb_basis_w[1]
+fvb_trendRuleDown_w = i_trendMode == "Cross" ? fvb_threshDnSrc_w < fvb_lowerBoosted_w : fvb_basis_w < fvb_basis_w[1]
+
+var int dirSwitch_w = 0
+if fvb_trendRuleDown_w
+    dirSwitch_w := -1
+else if fvb_trendRuleUp_w
+    dirSwitch_w := 1
+
+weeklyBarClose    = timeframe.change("W")
+fvb_turnedGreen_w = weeklyBarClose and dirSwitch_w[1] == -1 and dirSwitch_w == 1
+fvb_turnedRed_w   = weeklyBarClose and dirSwitch_w[1] == 1  and dirSwitch_w == -1
+
+// ─────────────────────────────────────────────────────────────
+// B-XTRENDER (monthly) + DON BX (weekly)
+// ─────────────────────────────────────────────────────────────
+bx_shortTerm_m = request.security(syminfo.tickerid, "M", ta.rsi(ta.ema(close, short_l1) - ta.ema(close, short_l2), short_l3) - 50, lookahead = barmerge.lookahead_off)
+
+monthlyBarClose = timeframe.change("M")
+
+bx_isDarkRed_m    = bx_shortTerm_m < 0 and bx_shortTerm_m < bx_shortTerm_m[1]
+bx_isNotDarkRed_m = not bx_isDarkRed_m
+
+var bool bx_monthlyNotDarkRed = false
+if monthlyBarClose
+    bx_monthlyNotDarkRed := bx_isNotDarkRed_m
+
+donBx_w = request.security(syminfo.tickerid, "W", ta.rsi(donMid(i_donL1) - donMid(i_donL2), i_donL3) - 50, lookahead = barmerge.lookahead_off)
+donBxRising  = donBx_w > donBx_w[1]
+donBxFalling = donBx_w < donBx_w[1]
+
+// ─────────────────────────────────────────────────────────────
+// FILTERS
+// ─────────────────────────────────────────────────────────────
+dailyVolPct = request.security(syminfo.tickerid, "D", ta.sma(math.abs(close - close[1]) / close[1] * 100.0, i_volLookback), lookahead = barmerge.lookahead_off)
+volFilterPass = not i_useVolFilter or (not na(dailyVolPct) and dailyVolPct >= i_volMinPct)
+
+spyDaysAbove = request.security(i_regimeSymbol, "D", ta.barssince(close <= ta.sma(close, i_regimeMaLen)), lookahead = barmerge.lookahead_off)
+regimeOk = not i_useRegime or na(spyDaysAbove) or spyDaysAbove >= i_regimeConfirmDays
+
+inDateRange = not i_useDateRange or (time >= i_startDate and time <= i_endDate)
+
+// ─────────────────────────────────────────────────────────────
+// SIGNALS
+// ─────────────────────────────────────────────────────────────
+useDonMode = i_strategyMode == "Weekly DON BX"
+
+bxBuyPass   = bx_monthlyNotDarkRed
+fvbBuyPass  = fvb_turnedGreen_w
+bxSellPass  = monthlyBarClose and bx_isDarkRed_m
+fvbSellPass = fvb_turnedRed_w
+
+rulesEnabled = i_useBxRule or i_useFvbRule
+inBullCycle  = bx_monthlyNotDarkRed and dirSwitch_w == 1
+
+classicBuy =
+     rulesEnabled and
+     (i_useBxRule  ? bxBuyPass  : true) and
+     (i_useFvbRule ? fvbBuyPass : true)
+
+donBuy = inBullCycle and weeklyBarClose and donBxRising
+
+buySignal =
+     barstate.isconfirmed and
+     inDateRange and
+     volFilterPass and
+     regimeOk and
+     (useDonMode ? donBuy : classicBuy)
+
+classicSellCore =
+     (i_useBxRule  and bxSellPass)  or
+     (i_useFvbRule and fvbSellPass)
+
+donSellCore =
+     (weeklyBarClose and donBxFalling) or
+     bxSellPass
+
+sellSignal =
+     barstate.isconfirmed and
+     (useDonMode ? donSellCore : classicSellCore)
+
+// ─────────────────────────────────────────────────────────────
+// ORDERS — immediate or pullback-armed entry
+// ─────────────────────────────────────────────────────────────
+pbMode = i_entryMode == "Wait for pullback"
+
+var float armLevel = na
+var int   armWeeks = 0
+
+if buySignal and strategy.position_size == 0
+    if not pbMode
+        strategy.entry("Long", strategy.long)
+        armLevel := na
+    else
+        // Arm: limit order below the signal close. A fresh signal re-arms at the new level.
+        armLevel := close * (1.0 - i_pbPct / 100.0)
+        armWeeks := 0
+        strategy.entry("Long", strategy.long, limit = armLevel)
+
+// Manage a pending armed order — only re-evaluate on confirmed weekly closes
+if pbMode and not i_pbDebugNoCancel and not na(armLevel) and strategy.position_size == 0 and weeklyBarClose and barstate.isconfirmed
+    armWeeks += 1
+    if not inBullCycle or (i_useRegime and not regimeOk)
+        // Setup invalidated before fill — stand down
+        strategy.cancel("Long")
+        armLevel := na
+    else if armWeeks >= i_pbExpiryWeeks
+        strategy.cancel("Long")
+        if i_pbFallback
+            strategy.entry("Long", strategy.long)
+        armLevel := na
+
+// Filled — clear the armed state
+if strategy.position_size > 0
+    armLevel := na
+
+if sellSignal and strategy.position_size > 0
+    strategy.close("Long", comment = useDonMode ? "DON exit" : "Regime exit")
+
+// Visual reference on the chart
+plot(fairPriceSmooth, "Fair value basis", color = dirSwitch_w == 1 ? color.new(color.white, 50) : color.new(color.red, 50))
+plot(pbMode and not na(armLevel) and strategy.position_size == 0 ? armLevel : na, "Armed limit level", color = color.new(color.orange, 0), style = plot.style_linebr, linewidth = 2)
+bgcolor(not regimeOk and i_useRegime ? color.new(color.red, 92) : na, title = "Risk-off shading")
+
+// ─────────────────────────────────────────────────────────────
+// STATUS PANEL — compact, toggleable
+// ─────────────────────────────────────────────────────────────
+panelPosition = switch i_panelPos
+    "Top right"    => position.top_right
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    =>               position.top_left
+
+panelTextSize = switch i_panelSize
+    1 => size.tiny
+    2 => size.small
+    3 => size.normal
+    4 => size.large
+    => size.huge
+
+var statusPanel = table.new(panelPosition, 2, 6, bgcolor = color.new(color.black, 80), border_width = 1, border_color = color.rgb(40, 40, 40))
+
+if barstate.islast and i_showPanel
+    table.clear(statusPanel, 0, 0, 1, 5)
+    lblBg   = color.new(color.black, 88)
+    okBg    = color.new(color.green, 72)
+    badBg   = color.new(color.red, 72)
+    warnBg  = color.new(color.orange, 68)
+    neutBg  = color.new(color.gray, 85)
+
+    table.cell(statusPanel, 0, 0, useDonMode ? "DON BX" : "CLASSIC", text_color = color.white, text_size = panelTextSize, bgcolor = neutBg)
+    table.cell(statusPanel, 1, 0, strategy.position_size > 0 ? "LONG" : not na(armLevel) ? "ARMED" : "FLAT", text_color = color.white, text_size = panelTextSize, bgcolor = strategy.position_size > 0 ? okBg : not na(armLevel) ? warnBg : badBg)
+
+    table.cell(statusPanel, 0, 1, "Regime", text_color = color.white, text_size = panelTextSize, bgcolor = lblBg)
+    table.cell(statusPanel, 1, 1, not i_useRegime ? "Off" : regimeOk ? "ON" : "OFF", text_color = color.white, text_size = panelTextSize, bgcolor = not i_useRegime ? neutBg : regimeOk ? okBg : badBg)
+
+    table.cell(statusPanel, 0, 2, "Volat", text_color = color.white, text_size = panelTextSize, bgcolor = lblBg)
+    table.cell(statusPanel, 1, 2, na(dailyVolPct) ? "n/a" : str.tostring(math.round(dailyVolPct * 100) / 100) + "%", text_color = color.white, text_size = panelTextSize, bgcolor = not i_useVolFilter ? neutBg : volFilterPass ? okBg : badBg)
+
+    table.cell(statusPanel, 0, 3, "Bull cycle", text_color = color.white, text_size = panelTextSize, bgcolor = lblBg)
+    table.cell(statusPanel, 1, 3, inBullCycle ? "Yes" : "No", text_color = color.white, text_size = panelTextSize, bgcolor = inBullCycle ? okBg : badBg)
+
+    if not na(armLevel) and strategy.position_size == 0
+        table.cell(statusPanel, 0, 4, "Limit @", text_color = color.white, text_size = panelTextSize, bgcolor = lblBg)
+        table.cell(statusPanel, 1, 4, str.tostring(math.round(armLevel * 100) / 100) + " (" + str.tostring(armWeeks) + "w)", text_color = color.white, text_size = panelTextSize, bgcolor = warnBg)
+

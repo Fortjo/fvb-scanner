@@ -1,0 +1,9 @@
+//@version=3
+study(title="Gooner EMA", overlay=true)
+short = ema(close, 17)
+long = ema(close, 40)
+slow = ema(close,131)
+plot(short, color = green)
+plot(long, color = red)
+plot(slow, color = orange)
+plot(cross(short, long) ? short : na, style = cross, linewidth = 4)

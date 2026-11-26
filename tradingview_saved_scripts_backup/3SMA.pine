@@ -1,0 +1,9 @@
+study(title="3SMA", shorttitle="3SMA", overlay=true)
+
+SMA1 = input(21, minval=1, title="SMA1"),
+SMA2 = input(50, minval=1, title="SMA2")
+SMA3 = input(200, minval=1, title="SMA3"),
+
+plot(sma(close, SMA1), color=white, linewidth=2)
+plot(sma(close, SMA2), color=yellow, linewidth=2)
+plot(sma(close, SMA3), color=red, linewidth=2)

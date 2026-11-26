@@ -1,0 +1,953 @@
+//@version=6
+// =============================================================================
+// THT 33FVB Strategy / SMZ  +  Smart Money Zones  — COMBINED [Reconstruction]
+// =============================================================================
+// Two independently-built reconstructions merged into ONE indicator so a free
+// TradingView plan (2-indicator limit) can run both at once. Toggle the SMZ
+// module on/off with "Show Smart Money Zones" below. Nothing else changes
+// between the two modules — they just share one script + one dashboard.
+//
+// Fix vs the standalone 33FVB file: the dashboard's f_row() function was
+// declared INSIDE an `if` block, which Pine v6 rejects (local functions must
+// sit at the script's top level). Moved to top level here — that was error
+// CE10156 "Syntax error at input 'r'" on the old line 182.
+//
+// See the standalone files for the full list of reconstruction assumptions
+// ([A1]-[A6] for FVB, [A1]-[A4] for SMZ) — same assumptions apply here,
+// unchanged.
+// =============================================================================
+indicator("THT 33FVB / SMZ / Volume Pro [Combined]", shorttitle="FVBSMZVol", overlay=true, max_labels_count=500, max_boxes_count=750, max_lines_count=500)
+
+// =============================================================================
+// MODULE SWITCH
+// =============================================================================
+showSMZ = input.bool(true, "Show Smart Money Zones module", group="Module switch")
+showVolProfile = input.bool(true, "Show Volume Profile module", group="Module switch")
+showBandsTop = input.bool(false, "Show FVB bands", group="Module switch")
+showSMZDiag = input.bool(false, "Show SMZ diagnostic label", group="Module switch", tooltip="Debug readout showing the exact top/low/lastConfirmedHigh values the SMZ zone is using. Leave off unless troubleshooting.")
+showFVBDiag = input.bool(false, "Show FVB diagnostic label", group="Module switch", tooltip="Debug readout showing the current basis/upper/lower band and green/red state, for checking against the Python-validated ORCL flip timeline. Leave off unless troubleshooting.")
+
+// =============================================================================
+// MODULE 1: 33FVB STRATEGY
+// =============================================================================
+grpS  = "33FVB: Strategy"
+tfFVB     = input.timeframe("1M", "FVB signal timeframe", group=grpS, tooltip="Controls the aggregation period for the real FVB algorithm. Only the Monthly setting (1M) has been validated against Peter's ORCL dashboard — other timeframes will run, but haven't been checked for accuracy yet.")
+lenFVB    = input.int(33, "FVB length", minval=2, group=grpS)
+bandSel   = input.string("High", "Entry band", options=["High", "Mid", "Low"], group=grpS)
+tpMode    = input.string("New N-bar high", "Take-profit", options=["New N-bar high", "Equal high (swing)"], group=grpS)
+nBarLen   = input.int(200, "N-bar high length", minval=2, group=grpS)
+pivL      = input.int(5, "Swing pivot L", minval=1, group=grpS, inline="piv")
+pivR      = input.int(5, "Swing pivot R", minval=1, group=grpS, inline="piv")
+rtCostPct = input.float(0.1, "Round-trip cost %", minval=0.0, step=0.05, group=grpS)
+
+grpA  = "33FVB: Reconstruction assumptions"
+// [bandMult removed — the real median-deviation band doesn't use a
+// multiplier; it was only needed for the old guessed percentage-volatility
+// formula, now replaced.]
+// [A2 CORRECTED] Entry bands sit at upper band / basis / lower band.
+// Original reconstruction wrongly placed all three BELOW the basis; a bar-by-
+// bar diagnostic on MSFT (1989/1993/2013/2015 pullbacks) proved real entries
+// touch the UPPER band from above: "shallow fill" = upper band,
+// "deep discount" = lower band. Matches the 3-line Simplified FVB screenshot.
+fracHigh  = input.float(1.0,  "[A2] High band position (+1 = upper band)", step=0.05, group=grpA)
+fracMid   = input.float(0.0,  "[A2] Mid band position (0 = basis)",  step=0.05, group=grpA)
+fracLow   = input.float(-1.0, "[A2] Low band position (-1 = lower band)",  step=0.05, group=grpA)
+// [stateMode removed — isGreen now always comes from the real sticky
+// Cross-based algorithm, not a choice between slope/close-vs-basis.]
+stopDef   = input.string("Basis slope flip", "[A3b] Stop definition", options=["Basis slope flip", "Close below basis", "Close below lower band", "Close below SMZ zone low"], group=grpA, tooltip="'Close below SMZ zone low' uses the swing low that defines the current Smart Money Zone. Requires the SMZ module to stay enabled — if it's turned off, this stop will never trigger, since the zone low it needs never updates.")
+eqHighAlt = input.bool(false, "[A4] Equal-high = PRIOR swing high level instead", group=grpA)
+
+grpV = "33FVB: Visuals"
+showMarkers = input.bool(true, "Show entry/exit markers", group=grpV)
+showPosBG   = input.bool(true, "Position background", group=grpV)
+bgOpacity   = input.int(90, "BG opacity", minval=0, maxval=100, group=grpV)
+
+grpD = "33FVB: Dashboard"
+showDash = input.bool(true, "Show stats dashboard", group="Module switch")
+
+// ---- SMZ pivot settings (moved here, ahead of Module 1) -------------------
+// These need to exist before Module 1's stop logic, since the new "Close
+// below SMZ zone low" stop option references the SMZ zone's defining low —
+// computed just below — on the SAME bar it updates. Pine executes top to
+// bottom, so anything Module 1 reads must be computed earlier in the file.
+grpP = "SMZ: Pivot settings"
+smzPivL    = input.int(10, "Pivot Length L", minval=1, group=grpP, inline="spl", tooltip="With the structure-break design, the swing TOP is protected by a max-guard (a lower pivot high can never replace a higher one), so a long confirmation window is no longer needed to find the true peak. 10 (the reference script's default) balances responsiveness vs noise. Raise for fewer/larger swings.")
+smzPivR    = input.int(10, "Pivot Length R", minval=1, group=grpP, inline="spl")
+smzPivSrc  = input.string("Wick", "Pivot Source", options=["Wick", "Body"], group=grpP)
+smzMitMeth = input.string("Wick", "Pivot Mitigation Method", options=["Wick", "Close"], group=grpP)
+
+// ---- SMZ zigzag core (state only — box drawing happens later, in MODULE 2)
+srcHi = smzPivSrc == "Wick" ? high : math.max(open, close)
+srcLo = smzPivSrc == "Wick" ? low  : math.min(open, close)
+phV = ta.pivothigh(srcHi, smzPivL, smzPivR)
+plV = ta.pivotlow(srcLo, smzPivL, smzPivR)
+newPH = showSMZ and not na(phV)
+newPL = showSMZ and not na(plV)
+
+var float zzVal      = na
+var int   zzIdx       = na
+var int   zzTrend     = 0
+var float zoneLowUsed    = na   // the low that defines the CURRENT (most recent) SMZ buy zone
+var int   zoneLowUsedIdx = na
+var float zoneHighUsed   = na   // the high that defines the CURRENT SMZ sell zone
+var int   zoneHighUsedIdx = na
+var bool  buyZoneFinalizedNow  = false   // true only on the bar a new buy zone is finalized
+var bool  sellZoneFinalizedNow = false
+
+// [CASCADE] frozen history of every finalized buy zone's ORIGINAL levels —
+// top (the high), bottom (the low that preceded it), and left-edge bar —
+// kept independent of the "Buy Zones" display count, since cascading needs
+// to reach further back than what's normally shown. Capped generously here
+// (15); the user-facing "Cascade depth" setting (declared later, in Module
+// 2) limits how many of these the cascade is actually allowed to step
+// through before giving up.
+var array<float> cascTop     = array.new_float()
+var array<float> cascBot     = array.new_float()
+var array<int>   cascLeftIdx = array.new_int()
+CASC_CAP = 15
+
+buyZoneFinalizedNow  := false
+sellZoneFinalizedNow := false
+
+if newPH
+    zzCandIdx = bar_index - smzPivR
+    if zzTrend == 1
+        if phV > zzVal
+            zzVal := phV
+            zzIdx := zzCandIdx
+    else
+        if not na(zzVal)
+            zoneLowUsed    := zzVal
+            zoneLowUsedIdx := zzIdx
+            buyZoneFinalizedNow := true
+            array.push(cascTop, phV)
+            array.push(cascBot, zzVal)
+            array.push(cascLeftIdx, zzIdx)
+            if array.size(cascTop) > CASC_CAP
+                array.shift(cascTop)
+                array.shift(cascBot)
+                array.shift(cascLeftIdx)
+        zzVal   := phV
+        zzIdx   := zzCandIdx
+        zzTrend := 1
+
+if newPL
+    zzCandIdx2 = bar_index - smzPivR
+    if zzTrend == -1
+        if plV < zzVal
+            zzVal := plV
+            zzIdx := zzCandIdx2
+    else
+        if not na(zzVal)
+            zoneHighUsed    := zzVal
+            zoneHighUsedIdx := zzIdx
+            sellZoneFinalizedNow := true
+        zzVal   := plV
+        zzIdx   := zzCandIdx2
+        zzTrend := -1
+
+dashSize = input.string("Small", "Text size", options=["Tiny", "Small", "Normal"], group=grpD)
+dashCompact = input.bool(false, "Compact mode (mobile)", group=grpD, tooltip="Collapses the 17-row dashboard down to ~7 rows by combining related stats onto shared lines. Meant for phone screens, where the full table can take up most of the chart.")
+dashPos  = input.string("Top right", "Position", options=["Top right", "Top left", "Bottom right", "Bottom left"], group=grpD)
+
+// --------------------------- HTF FVB ENGINE ---------------------------------
+// [FULL TRANSPLANT — validated against ORCL in Python: went from capturing
+// 2.8% of Peter's total return to 81%, with stop count matching exactly
+// (1/1) and win rate within a point (92.9% vs his 94.1%)] This replaces the
+// old guessed percentage-volatility band and basis-slope state with the
+// REAL algorithm found in the source (quantifytools' Fair Value Bands,
+// Cross mode): the band is a MEDIAN of historical high/low deviation
+// ratios from the basis (not a stdev multiple), and the state is STICKY —
+// it only flips on a decisive break of the band, not every time the
+// average ticks up or down.
+//
+// Computed via manual monthly aggregation on the CHART'S OWN bars (not
+// request.security) — a prior attempt to run comparable array/median logic
+// inside request.security() (the SMZ zigzag) silently produced nothing at
+// all. This sidesteps that risk entirely. Only supports a Monthly signal
+// timeframe for now (matching what's actually been validated) — let me
+// know if you need a different signal timeframe generalized.
+newMonthBar = timeframe.change(tfFVB)
+
+var float mO = na
+var float mH = na
+var float mL = na
+var float prevMO = na   // the JUST-COMPLETED month's O/H/L, captured before reset
+var float prevMH = na
+var float prevML = na
+
+if newMonthBar
+    // [BUG FIX] capture the completed month's values BEFORE overwriting —
+    // the reset below was clobbering mO/mH/mL with the NEW month's data
+    // before the finalization step (further down) could read the OLD
+    // month's data from them, silently computing the basis from the wrong
+    // month's range mixed with the previous month's close. This produced
+    // garbage basis values, which is why the live indicator showed 18
+    // trades/50% win rate instead of matching the 14/93% we validated.
+    prevMO := mO
+    prevMH := mH
+    prevML := mL
+    mO := open
+    mH := high
+    mL := low
+else
+    mH := na(mH) ? high : math.max(mH, high)
+    mL := na(mL) ? low  : math.min(mL, low)
+
+var array<float> ohlc4Hist = array.new_float()
+var array<float> devUpArr  = array.new_float()
+var array<float> devDnArr  = array.new_float()
+
+var float basis = na
+var float upperB = na
+var float lowerB = na
+var bool  isGreen = false
+
+// [TIMING FIX — July 2026] One extra month of delay, matching the Python
+// engine's shift(1). Python (validated EXACTLY against Peter's dashboard
+// on SPY/SOFI/PLTR) only lets a month's finalized values become active a
+// full month later. This file previously promoted the just-completed
+// month's values immediately — one month FRESHER than Python on every
+// bar, producing extra entries (12 vs the correct ~8-10 on WMT) and
+// shifted exits. pend* holds freshly finalized values during the
+// in-between month.
+var float pendBasis = na
+var float pendUpper = na
+var float pendLower = na
+var bool  pendGreen = false
+
+if newMonthBar and not na(prevMO) and not na(prevMH) and not na(prevML)
+    // promote LAST month's finalized values into ACTIVE first...
+    basis   := pendBasis
+    upperB  := pendUpper
+    lowerB  := pendLower
+    isGreen := pendGreen
+    // ...then finalize the just-completed month into PENDING
+    completedClose = close[1]
+    completedOhlc4 = (prevMO + prevMH + prevML + completedClose) / 4
+    array.push(ohlc4Hist, completedOhlc4)
+    if array.size(ohlc4Hist) > lenFVB
+        array.shift(ohlc4Hist)
+    if array.size(ohlc4Hist) == lenFVB
+        newBasis = array.sum(ohlc4Hist) / lenFVB
+        straddle = prevML < newBasis and prevMH > newBasis
+        array.push(devUpArr, straddle ? prevMH / newBasis : na)
+        array.push(devDnArr, straddle ? prevML / newBasis : na)
+        if array.size(devUpArr) > 1000
+            array.shift(devUpArr)
+        if array.size(devDnArr) > 1000
+            array.shift(devDnArr)
+        medUp = array.median(devUpArr)
+        medDn = array.median(devDnArr)
+        pendBasis := newBasis
+        pendUpper := na(medUp) ? na : newBasis * medUp
+        pendLower := na(medDn) ? na : newBasis * medDn
+        if not na(pendLower) and prevMH < pendLower
+            pendGreen := false
+        else if not na(pendUpper) and prevML > pendUpper
+            pendGreen := true
+        // else: pendGreen keeps its previous value — this stickiness is the
+        // whole reason the real indicator flips so rarely.
+
+frac     = bandSel == "High" ? fracHigh : bandSel == "Mid" ? fracMid : fracLow
+entryBnd = bandSel == "High" ? upperB : bandSel == "Low" ? lowerB : basis
+
+stopTriggered = false
+if stopDef == "Basis slope flip"
+    stopTriggered := not isGreen
+else if stopDef == "Close below basis"
+    stopTriggered := not na(basis) and close < basis
+else if stopDef == "Close below lower band"
+    stopTriggered := not na(lowerB) and close < lowerB
+else
+    stopTriggered := not na(zoneLowUsed) and close < zoneLowUsed
+
+if showFVBDiag and barstate.islast
+    fvbDiagTxt = "FVB diag  basis=" + (na(basis) ? "na" : str.tostring(basis, format.mintick))
+         + "  upper=" + (na(upperB) ? "na" : str.tostring(upperB, format.mintick))
+         + "  lower=" + (na(lowerB) ? "na" : str.tostring(lowerB, format.mintick))
+         + "  state=" + (isGreen ? "GREEN" : "RED")
+    label.new(bar_index, low, fvbDiagTxt, style=label.style_label_up, color=color.new(color.blue, 20), textcolor=color.white, size=size.small)
+
+// --------------------------- SWING PIVOTS (chart TF) ------------------------
+ph = ta.pivothigh(high, pivL, pivR)
+var float lastPH = na
+if not na(ph)
+    lastPH := ph
+
+// --------------------------- TRADE STATE + STATS ----------------------------
+var bool  inPos      = false
+var float entryPrice = na
+var int   entryBar   = na
+var float eqTarget   = na
+var float entryTPTarget = na  // [TP FIX] hybrid 200-bar-high / swing-high target, fixed at entry
+
+// NOTE: each `var` declaration MUST be on its own line. A comma on one line
+// separates independent statements in Pine, so `var int a = 0, b = 0` only
+// makes `a` persistent — `b` silently becomes a normal variable that resets
+// to 0 on every bar. That bug zeroed win rate / TP / Stop / DD in the dashboard.
+var int   trades  = 0
+var int   wins    = 0
+var int   tpCnt   = 0
+var int   stopCnt = 0
+var float grossW  = 0.0
+var float grossL  = 0.0
+var float sumRet  = 0.0
+var float equity  = 1.0
+var float peakEq  = 1.0
+var float maxDD   = 0.0
+var int   holdSum = 0
+
+// Pine v6 does not allow a user function to reassign outer-scope (global)
+// variables — only top-level code (not inside a `=>` function) can do that.
+// So the exit/stat-update logic below is inlined directly here instead of
+// living in a separate f_exit() function.
+prevHH = ta.highest(high, nBarLen)[1]
+
+if inPos
+    exitPx  = float(na)
+    exitTag = ""
+    if tpMode == "New N-bar high"
+        if not na(entryTPTarget) and high >= entryTPTarget and bar_index > entryBar
+            exitPx  := math.max(open, entryTPTarget)
+            exitTag := "TP"
+    else
+        if eqHighAlt
+            if not na(eqTarget) and high >= eqTarget
+                exitPx  := math.max(open, eqTarget)
+                exitTag := "TP"
+        else
+            if not na(ph) and (bar_index - pivR) > entryBar
+                exitPx  := close
+                exitTag := "TP"
+    if na(exitPx) and stopTriggered
+        exitPx  := close
+        exitTag := "STOP"
+
+    if not na(exitPx)
+        ret = exitPx / entryPrice - 1.0 - rtCostPct / 100.0
+        trades += 1
+        sumRet += ret
+        if ret > 0
+            wins += 1
+            grossW += ret
+        else
+            grossL += -ret
+        if exitTag == "TP"
+            tpCnt += 1
+        else
+            stopCnt += 1
+        holdSum += bar_index - entryBar
+        equity *= (1.0 + ret)
+        peakEq := math.max(peakEq, equity)
+        maxDD  := math.min(maxDD, equity / peakEq - 1.0)
+        if showMarkers
+            label.new(time, high, exitTag + " " + str.tostring(ret * 100, "#.#") + "%",
+                 xloc = xloc.bar_time, style = label.style_label_down,
+                 color = exitTag == "TP" ? color.new(color.blue, 0) : color.new(color.red, 0),
+                 textcolor = color.white, size = size.small)
+        inPos := false
+        entryPrice := na
+        eqTarget := na
+
+// [BUG FIX] "low <= entryBnd" alone is also trivially true whenever price
+// simply hasn't risen UP to the band yet (e.g. early in a stock's history,
+// when the lagging basis+band sits above an as-yet-cheap price) — not just
+// on a genuine pullback FROM ABOVE. That let the strategy buy in near a
+// stock's historical floor by accident and ride an entire multi-decade
+// uptrend on one fluke trade (seen as a +1127% "average win" on MSFT).
+// Require the prior bar's close to have already been above the prior band,
+// confirming a real breakout-then-pullback rather than a first-ever touch.
+canEnter = not inPos and isGreen and not na(entryBnd) and low <= entryBnd and close[1] > entryBnd[1]
+if canEnter
+    entryPrice := math.min(open, entryBnd)
+    entryBar   := bar_index
+    inPos      := true
+    eqTarget   := eqHighAlt and not na(lastPH) and lastPH > entryPrice ? lastPH : na
+    // [TP FIX — July 2026] prevHH (the 200-bar rolling high) can lock onto
+    // an ancient, no-longer-relevant spike (confirmed on real tickers:
+    // RDW's 200wk high sat at $26.66 from early SPAC-era trading while the
+    // stock actually traded $7-13 — TP became mathematically unreachable).
+    // It can also simply be `na` if the stock hasn't existed for a full
+    // 200 bars yet (LUNR's case). Fixed at ENTRY, not recomputed each bar
+    // — validated in Python across the full universe: this hybrid raised
+    // expectancy from +14.72% to +16.01%/trade and PF from 3.37 to 3.57
+    // vs always using the raw 200-bar high, while fixing both known dead
+    // cases (RDW, LUNR) — full backtest, not a guess.
+    hhMissing = na(prevHH)
+    hhStale   = not hhMissing and prevHH > entryPrice * 2.5
+    entryTPTarget := (hhMissing or hhStale) and not na(lastPH) ? lastPH : prevHH
+    if showMarkers
+        label.new(time, low, "BUY", xloc = xloc.bar_time, style=label.style_label_up,
+             color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+
+// ------------------------------- VISUALS ------------------------------------
+pBasis = plot(showBandsTop ? basis : na, "FVB basis", color = isGreen ? color.green : color.red, linewidth = 2)
+pUp    = plot(showBandsTop ? upperB : na, "FVB upper", color = color.new(color.teal, 60))
+pLo    = plot(showBandsTop ? lowerB : na, "FVB lower", color = color.new(color.teal, 60))
+plot(showBandsTop ? entryBnd : na, "Entry band", color = color.new(color.orange, 0), style = plot.style_linebr)
+fill(pUp, pLo, color = showBandsTop ? color.new(isGreen ? color.green : color.red, 92) : na)
+
+bgcolor(showPosBG and inPos ? color.new(color.green, bgOpacity) : na)
+
+// =============================================================================
+// MODULE 2: SMART MONEY ZONES  (toggle: showSMZ)
+// =============================================================================
+// Pivot settings (smzPivL/R/Src/MitMeth) and the core zigzag state moved
+// above Module 1 — see the "SMZ pivot settings" section near the top of the
+// script. Everything below just draws boxes from the already-computed state.
+grpZ = "SMZ: Zone settings"
+buyZonesN  = input.int(1, "Buy Zones", minval=0, maxval=10, group=grpZ, inline="bz")
+showInstB  = input.bool(true, "Show Institutional (buy)", group=grpZ, inline="bz")
+sellZonesN = input.int(0, "Sell Zones", minval=0, maxval=10, group=grpZ, inline="sz")
+showInstS  = input.bool(true, "Show Institutional (sell)", group=grpZ, inline="sz")
+brokenMode = input.string("SMZ deep edge (wick)", "[A2] Broken definition", options=["SMZ deep edge (wick)", "Full swing (1.0) break"], group=grpZ)
+showMajorZone = input.bool(false, "Show Major Structure Zone (big picture)", group=grpZ, tooltip="A SECOND, independent zone using the largest swing seen on the chart (true all-time high/low, never replaced by a smaller one) — shown alongside the normal zone so you always have the bigger-picture reference available, e.g. once the immediate zone is broken.")
+showCascade = input.bool(false, "Show cascading zone (steps back on break)", group=grpZ, tooltip="Elliott-Wave-style fallback: when the current zone's deep edge breaks (candle closes below it), instead of just going gray, jumps back to the PREVIOUS zone's original, frozen price levels (e.g. Wave 3's retracement breaks -> falls back to Wave 1-2's zone). Levels are never recalculated — always the actual historical range. Independent of 'Buy Zones' above, which controls a different thing (how many zones stay visible at once).")
+cascadeDepth = input.int(3, "Cascade depth (zones back)", minval=1, maxval=10, group=grpZ, tooltip="How many zones back the cascade is allowed to step before giving up and going gray like normal.")
+majorLookbackYrs = input.int(10, "Major zone lookback (years, 0 = no cap)", minval=0, group=grpZ, tooltip="Limits how far back the Major Structure Zone can reach for its all-time high/low. On tickers with decades of history, an uncapped zone can span back to the 1970s/80s, which is technically correct but not very actionable. 0 disables the cap (true all-time).")
+majorColor = input.color(color.new(#78909c, 70), "Major zone color", group=grpZ)
+
+grpF = "SMZ: [A1] Fib levels"
+fInstTop = input.float(0.618, "Institutional top", step=0.001, group=grpF)
+fSmzTop  = input.float(0.786, "Smart Money top",  step=0.001, group=grpF)
+fSmzBot  = input.float(0.826, "Smart Money bottom", step=0.001, group=grpF)
+
+grpDs = "SMZ: Display"
+showZoneText = input.bool(true, "Show Zone Text", group=grpDs, inline="zt")
+zoneTxtSize  = input.string("small", "size", options=["tiny", "small", "normal"], group=grpDs, inline="zt")
+startAtPivot = input.bool(true, "Start Zone at Pivot", group=grpDs)
+showDeveloping = input.bool(false, "Show developing zone (live preview)", group=grpDs, tooltip="Previews the NEXT buy zone in real time, using the currently-extending swing high, before it's officially confirmed. Updates every bar instead of waiting out the pivot length. Shown with a dotted border to mark it as tentative — it can still shift if a taller high forms before the next pivot low confirms.")
+showZoneLine = input.bool(true, "Show Line (swing extreme)", group=grpDs)
+showBOS      = input.bool(false, "Show Break of Structure", group=grpDs)
+colInstB = input.color(color.new(#2962ff, 75), "Institutional buy", group=grpDs, inline="cb")
+colSmzB  = input.color(color.new(#9c27b0, 60), "SMZ buy", group=grpDs, inline="cb")
+colInstS = input.color(color.new(#ef5350, 75), "Institutional sell", group=grpDs, inline="cs")
+colSmzS  = input.color(color.new(#7b1fa2, 60), "SMZ sell", group=grpDs, inline="cs")
+
+
+
+var array<box>   bInst = array.new<box>()
+var array<box>   bSmz  = array.new<box>()
+var array<float> bDeep = array.new<float>()
+var array<float> bFull = array.new<float>()
+var array<bool>  bAct  = array.new<bool>()
+var array<line>  bLine = array.new<line>()
+
+var array<box>   sInst = array.new<box>()
+var array<box>   sSmz  = array.new<box>()
+var array<float> sDeep = array.new<float>()
+var array<float> sFull = array.new<float>()
+var array<bool>  sAct  = array.new<bool>()
+var array<line>  sLine = array.new<line>()
+
+zSize = zoneTxtSize == "tiny" ? size.tiny : zoneTxtSize == "small" ? size.small : size.normal
+tfTxt = timeframe.period
+
+f_trim(array<box> a1, array<box> a2, array<float> a3, array<float> a4, array<bool> a5, array<line> a6, int keep) =>
+    while array.size(a1) > keep
+        box.delete(array.shift(a1))
+        box.delete(array.shift(a2))
+        array.shift(a3)
+        array.shift(a4)
+        array.shift(a5)
+        ln = array.shift(a6)
+        if not na(ln)
+            line.delete(ln)
+
+// ---- Proper alternating zigzag ------------------------------------------
+// [REDESIGN — Elliott/zigzag-style swing tracking]
+// Neither previous design was quite right: the max-guard (protect the
+// all-time high forever) correctly resisted shallow highs mid-decline, but
+// went permanently stale once the market spent a long time below that peak
+// without ever exceeding it (the CHD case — box frozen since Jan 2025 while
+// real, tradeable swings kept forming after it). The "always pair with the
+// nearest low" design (before that) had no such staleness but could pair a
+// shallow, meaningless high with an unrelated nearby low.
+//
+// A proper zigzag gets both right: track ONE current extreme that can only
+// EXTEND (get taller/lower) while we're still in the same phase — so a
+// shallow high mid-rally is correctly ignored, exactly like the max-guard
+// did. But the INSTANT the opposite side confirms (a real low breaks the
+// rally), the extreme is finalized as a real swing point and a NEW leg
+// starts immediately — so the zone always reflects the CURRENT structure,
+// never locks onto an old peak indefinitely just because nothing has beaten
+// it since.
+// (zzVal/zzIdx/zzTrend/zoneLowUsed/zoneHighUsed are computed early, above
+// Module 1 — see "SMZ zigzag core". This section only draws from that state.)
+
+// ---- Major structure zone (the OLD max-guard design, kept as a SECOND,
+// independent "big picture" zone) — the true all-time high/low on the
+// chart, each only ever replaced by a genuinely more extreme confirmed
+// pivot, never a smaller one. Distinct from the zigzag zone above (which
+// always reflects the CURRENT/most recent leg); this one answers "what's
+// the largest structure still in play" regardless of how much smaller,
+// more recent structure has happened since.
+var float majorHigh    = na
+var int   majorHighIdx = na
+var float majorLow     = na
+var int   majorLowIdx  = na
+var box   majorBox     = na
+var box   majorBox2    = na
+var line  majorLine    = na
+
+// [LOOKBACK CAP] without this, majorHigh/majorLow can lock onto a decades-old
+// extreme that's never been beaten since — technically correct ("the true
+// all-time swing") but not a practically tradeable zone on a ticker with
+// 40+ years of history. Aging out an old extreme lets a more recent, more
+// actionable one take its place.
+maxAgeMs = majorLookbackYrs * 365 * 24 * 60 * 60 * 1000
+if majorLookbackYrs > 0 and not na(majorHighIdx) and (time - time[bar_index - majorHighIdx]) > maxAgeMs
+    majorHigh := na
+    majorHighIdx := na
+if majorLookbackYrs > 0 and not na(majorLowIdx) and (time - time[bar_index - majorLowIdx]) > maxAgeMs
+    majorLow := na
+    majorLowIdx := na
+
+if newPH
+    mCandIdx = bar_index - smzPivR
+    if na(majorHigh) or phV > majorHigh
+        majorHigh    := phV
+        majorHighIdx := mCandIdx
+if newPL
+    mCandIdx2 = bar_index - smzPivR
+    if na(majorLow) or plV < majorLow
+        majorLow    := plV
+        majorLowIdx := mCandIdx2
+
+if showMajorZone and showSMZ and (newPH or newPL) and not na(majorHigh) and not na(majorLow) and majorHigh > majorLow
+    mRng     = majorHigh - majorLow
+    mInstTop = majorHigh - fInstTop * mRng
+    mSmzTop  = majorHigh - fSmzTop  * mRng
+    mSmzBot  = majorHigh - fSmzBot  * mRng
+    mLt      = majorLowIdx < majorHighIdx ? time[bar_index - majorLowIdx] : time[bar_index - majorHighIdx]
+    if not na(majorBox)
+        box.delete(majorBox)
+        box.delete(majorBox2)
+        line.delete(majorLine)
+    majorBox  := box.new(mLt, mInstTop, time, mSmzTop, xloc = xloc.bar_time, border_color = color.new(majorColor, 20), bgcolor = majorColor, text = "Major Structure | " + tfTxt, text_color = color.white, text_size = zSize, border_style = line.style_dashed)
+    majorBox2 := box.new(mLt, mSmzTop, time, mSmzBot, xloc = xloc.bar_time, border_color = color.new(majorColor, 20), bgcolor = color.new(majorColor, 15), text = "", text_size = zSize, border_style = line.style_dashed)
+    majorLine := line.new(mLt, majorLow, time, majorLow, xloc = xloc.bar_time, color = color.new(majorColor, 10), style = line.style_dashed)
+else if showMajorZone and showSMZ and not na(majorBox)
+    box.set_right(majorBox, time)
+    box.set_right(majorBox2, time)
+    line.set_x2(majorLine, time)
+
+// ---- Cascade: steps back to the PREVIOUS zone's frozen original levels
+// when the current one's deep edge breaks (candle closes below it), rather
+// than just fading to gray. Levels are never recalculated — always the
+// actual historical [low, high] range from when that zone was first
+// finalized, matching real Elliott Wave structure (e.g. Wave 3's
+// retracement fails -> falls back to the actual Wave 1-2 range).
+var int   cascActiveOffset = 0   // 0 = most recent zone, 1 = one back, etc.
+var box   cascBoxTop = na
+var box   cascBoxBot = na
+var line  cascLine   = na
+
+if buyZoneFinalizedNow
+    cascActiveOffset := 0   // a genuinely new zone resets the cascade to "current"
+
+nCasc = array.size(cascTop)
+if showCascade and showSMZ and nCasc > 0
+    cascIdx = nCasc - 1 - cascActiveOffset
+    if cascIdx >= 0
+        cTop = array.get(cascTop, cascIdx)
+        cBot = array.get(cascBot, cascIdx)
+        cLeftIdx = array.get(cascLeftIdx, cascIdx)
+        cRng = cTop - cBot
+        if cRng > 0
+            cDeepEdge = cTop - fSmzBot * cRng
+            // step back ONE zone further if this bar closes below the
+            // ACTIVE zone's deep edge, another step is available, and we
+            // haven't exceeded the user's cascade depth limit
+            if close < cDeepEdge and cascActiveOffset < cascadeDepth and cascIdx > 0
+                cascActiveOffset += 1
+                cascIdx := nCasc - 1 - cascActiveOffset
+                cTop := array.get(cascTop, cascIdx)
+                cBot := array.get(cascBot, cascIdx)
+                cLeftIdx := array.get(cascLeftIdx, cascIdx)
+                cRng := cTop - cBot
+            cInstTop = cTop - fInstTop * cRng
+            cSmzTop  = cTop - fSmzTop  * cRng
+            cSmzBot  = cTop - fSmzBot  * cRng
+            cLt      = time[bar_index - cLeftIdx]
+            cascLabel = cascActiveOffset == 0 ? "Institutional Buying | " + tfTxt : "Cascaded (-" + str.tostring(cascActiveOffset) + ") | " + tfTxt
+            if na(cascBoxTop)
+                cascBoxTop := box.new(cLt, cInstTop, time, cSmzTop, xloc = xloc.bar_time, border_color = color.new(color.orange, 30), bgcolor = color.new(color.orange, 85), text = showZoneText ? cascLabel : "", text_color = color.white, text_size = zSize)
+                cascBoxBot := box.new(cLt, cSmzTop, time, cSmzBot, xloc = xloc.bar_time, border_color = color.new(color.orange, 30), bgcolor = color.new(color.orange, 80), text = "", text_size = zSize)
+                cascLine   := showZoneLine ? line.new(cLt, cBot, time, cBot, xloc = xloc.bar_time, color = color.new(color.orange, 20), style = line.style_solid) : na
+            else
+                box.set_left(cascBoxTop, cLt)
+                box.set_top(cascBoxTop, cInstTop)
+                box.set_bottom(cascBoxTop, cSmzTop)
+                box.set_right(cascBoxTop, time)
+                box.set_text(cascBoxTop, showZoneText ? cascLabel : "")
+                box.set_left(cascBoxBot, cLt)
+                box.set_top(cascBoxBot, cSmzTop)
+                box.set_bottom(cascBoxBot, cSmzBot)
+                box.set_right(cascBoxBot, time)
+                if not na(cascLine)
+                    line.set_xy1(cascLine, cLt, cBot)
+                    line.set_xy2(cascLine, time, cBot)
+
+// ---- BUY zone: draw exactly when the early block just finalized one ----
+if buyZoneFinalizedNow and buyZonesN > 0
+    rng = phV - zoneLowUsed
+    if rng > 0
+        instTop = phV - fInstTop * rng
+        smzTop  = phV - fSmzTop  * rng
+        smzBot  = phV - fSmzBot  * rng
+        lt      = startAtPivot ? time[bar_index - zoneLowUsedIdx] : time
+        bi = showInstB ? box.new(lt, instTop, time, smzTop, xloc = xloc.bar_time, border_color = color.new(color.blue, 40), bgcolor = colInstB, text = showZoneText ? "Institutional Buying | " + tfTxt : "", text_color = color.white, text_size = zSize) : na
+        bs = box.new(lt, smzTop, time, smzBot, xloc = xloc.bar_time, border_color = color.new(color.purple, 30), bgcolor = colSmzB, text = showZoneText ? "Smart Money | " + tfTxt : "", text_color = color.white, text_size = zSize)
+        ln = showZoneLine ? line.new(lt, zoneLowUsed, time, zoneLowUsed, xloc = xloc.bar_time, color = color.new(color.white, 30), style = line.style_solid) : na
+        array.push(bInst, bi), array.push(bSmz, bs), array.push(bDeep, smzBot), array.push(bFull, zoneLowUsed), array.push(bAct, true), array.push(bLine, ln)
+        f_trim(bInst, bSmz, bDeep, bFull, bAct, bLine, buyZonesN)
+
+// ---- Developing zone: live preview of the NEXT buy zone, before it's
+// officially confirmed. Uses zzVal (the currently-extending high) instead
+// of waiting for a pivot low to finalize it — updates every bar, in place,
+// rather than redrawing from scratch. Disappears the moment the real zone
+// finalizes (zzTrend flips), since the confirmed zone takes over at that point.
+var box devBoxTop = na
+var box devBoxBot = na
+if showDeveloping and showSMZ and zzTrend == 1 and not na(zoneLowUsed) and buyZonesN > 0
+    devRng = zzVal - zoneLowUsed
+    if devRng > 0
+        devInstTop = zzVal - fInstTop * devRng
+        devSmzTop  = zzVal - fSmzTop  * devRng
+        devSmzBot  = zzVal - fSmzBot  * devRng
+        devLt = startAtPivot ? time[bar_index - zoneLowUsedIdx] : time
+        if na(devBoxTop)
+            devBoxTop := box.new(devLt, devInstTop, time, devSmzTop, xloc = xloc.bar_time, border_color = color.new(color.blue, 60), bgcolor = color.new(color.blue, 90), border_style = line.style_dotted, text = showZoneText ? "Developing..." : "", text_color = color.white, text_size = zSize)
+            devBoxBot := box.new(devLt, devSmzTop, time, devSmzBot, xloc = xloc.bar_time, border_color = color.new(color.purple, 60), bgcolor = color.new(color.purple, 90), border_style = line.style_dotted, text = "", text_size = zSize)
+        else
+            box.set_left(devBoxTop, devLt)
+            box.set_top(devBoxTop, devInstTop)
+            box.set_bottom(devBoxTop, devSmzTop)
+            box.set_right(devBoxTop, time)
+            box.set_left(devBoxBot, devLt)
+            box.set_top(devBoxBot, devSmzTop)
+            box.set_bottom(devBoxBot, devSmzBot)
+            box.set_right(devBoxBot, time)
+else
+    if not na(devBoxTop)
+        box.delete(devBoxTop)
+        box.delete(devBoxBot)
+        devBoxTop := na
+        devBoxBot := na
+
+// ---- SELL zone: mirror ----
+if sellZoneFinalizedNow and sellZonesN > 0
+    rng = zoneHighUsed - plV
+    if rng > 0
+        instBot = plV + fInstTop * rng
+        smzBot2 = plV + fSmzTop  * rng
+        smzTop2 = plV + fSmzBot  * rng
+        lt      = startAtPivot ? time[bar_index - zoneHighUsedIdx] : time
+        si = showInstS ? box.new(lt, smzBot2, time, instBot, xloc = xloc.bar_time, border_color = color.new(color.red, 40), bgcolor = colInstS, text = showZoneText ? "Institutional Selling | " + tfTxt : "", text_color = color.white, text_size = zSize) : na
+        ss = box.new(lt, smzTop2, time, smzBot2, xloc = xloc.bar_time, border_color = color.new(color.purple, 30), bgcolor = colSmzS, text = showZoneText ? "Smart Money | " + tfTxt : "", text_color = color.white, text_size = zSize)
+        ln = showZoneLine ? line.new(lt, zoneHighUsed, time, zoneHighUsed, xloc = xloc.bar_time, color = color.new(color.white, 30), style = line.style_solid) : na
+        array.push(sInst, si), array.push(sSmz, ss), array.push(sDeep, smzTop2), array.push(sFull, zoneHighUsed), array.push(sAct, true), array.push(sLine, ln)
+        f_trim(sInst, sSmz, sDeep, sFull, sAct, sLine, sellZonesN)
+
+// [DIAGNOSTIC] top/low now reflect the zigzag state directly: zzVal/zzTrend
+// show what's currently extending (not yet finalized), zoneLowUsed shows
+// what the CURRENT drawn box actually used.
+if showSMZ and showSMZDiag and barstate.islast
+    diagTxt = "SMZ diag  zz=" + (na(zzVal) ? "na" : str.tostring(zzVal, format.mintick) + " (" + (zzTrend == 1 ? "high" : "low") + ") @ " + str.format("{0,date,yyyy-MM-dd}", time[bar_index - zzIdx]))
+         + "   boxLow=" + (na(zoneLowUsed) ? "na" : str.tostring(zoneLowUsed, format.mintick) + " @ " + str.format("{0,date,yyyy-MM-dd}", time[bar_index - zoneLowUsedIdx]))
+    label.new(bar_index, high, diagTxt, style=label.style_label_down, color=color.new(color.orange, 20), textcolor=color.black, size=size.small)
+
+mitLow  = smzMitMeth == "Wick" ? low  : math.min(open, close)
+mitHigh = smzMitMeth == "Wick" ? high : math.max(open, close)
+
+if showSMZ and array.size(bSmz) > 0
+    for i = 0 to array.size(bSmz) - 1
+        if array.get(bAct, i)
+            edge = brokenMode == "SMZ deep edge (wick)" ? array.get(bDeep, i) : array.get(bFull, i)
+            if mitLow < edge
+                array.set(bAct, i, false)
+                box.set_bgcolor(array.get(bSmz, i), color.new(color.gray, 85))
+                bi = array.get(bInst, i)
+                if not na(bi)
+                    box.set_bgcolor(bi, color.new(color.gray, 88))
+                if showBOS
+                    line.new(time, edge, time + 1, edge, xloc = xloc.bar_time, extend = extend.right, color = color.new(color.orange, 40), style = line.style_dotted)
+            else
+                box.set_right(array.get(bSmz, i), time)
+                bi = array.get(bInst, i)
+                if not na(bi)
+                    box.set_right(bi, time)
+                ln = array.get(bLine, i)
+                if not na(ln)
+                    line.set_x2(ln, time)
+
+if showSMZ and array.size(sSmz) > 0
+    for i = 0 to array.size(sSmz) - 1
+        if array.get(sAct, i)
+            edge = brokenMode == "SMZ deep edge (wick)" ? array.get(sDeep, i) : array.get(sFull, i)
+            if mitHigh > edge
+                array.set(sAct, i, false)
+                box.set_bgcolor(array.get(sSmz, i), color.new(color.gray, 85))
+                si = array.get(sInst, i)
+                if not na(si)
+                    box.set_bgcolor(si, color.new(color.gray, 88))
+                if showBOS
+                    line.new(time, edge, time + 1, edge, xloc = xloc.bar_time, extend = extend.right, color = color.new(color.orange, 40), style = line.style_dotted)
+            else
+                box.set_right(array.get(sSmz, i), time)
+                si = array.get(sInst, i)
+                if not na(si)
+                    box.set_right(si, time)
+                ln = array.get(sLine, i)
+                if not na(ln)
+                    line.set_x2(ln, time)
+
+// =============================================================================
+// MODULE 3: VOLUME PROFILE  (toggle: showVolProfile)
+// =============================================================================
+grpVolI = "Volume: Inputs"
+volBarsBack  = input.int(150, "Bars Back (per current timeframe)", minval=1, maxval=5000, group=grpVolI)
+volCols      = input.int(35, "Columns", minval=5, maxval=200, group=grpVolI)
+volVaPct     = input.float(70.0, "Value Area %", minval=40.0, maxval=99.0, group=grpVolI)
+volHistWidth = input.int(24, "Histogram width (bars)", minval=6, maxval=200, group=grpVolI)
+volDirection = input.string("Into chart (left)", "Histogram direction", options=["Into chart (left)","Away from chart (right)"], group=grpVolI)
+volOffset    = input.int(0, "Histogram Offset (bars)", group=grpVolI)
+
+grpVolLbl = "Volume: Labels"
+showVolumeLabels = input.bool(true, "Show Volume Labels", group=grpVolLbl)
+volumeLabelSize  = input.string("tiny", "Volume Label Size", options=["tiny", "small", "normal", "large"], group=grpVolLbl)
+volLabelColor    = input.color(#000000, "Volume Label Color", group=grpVolLbl)
+
+grpVolStyle = "Volume: Block Style"
+blockFillColor      = input.color(#B0B0B0, "Volume Block Fill Color", group=grpVolStyle)
+blockFillOpacity    = input.int(70, "Volume Block Fill Opacity %", minval=0, maxval=100, group=grpVolStyle)
+blockBorderColor    = input.color(#000000, "Volume Block Border Color", group=grpVolStyle)
+blockBorderOpacity  = input.int(0, "Volume Block Border Opacity % (0=solid, 100=hidden)", minval=0, maxval=100, group=grpVolStyle)
+
+grpVolLines = "Volume: Lines"
+showPOC    = input.bool(true, "Show POC Line", group=grpVolLines)
+pocColor   = input.color(#FF0000, "POC color", group=grpVolLines)
+pocWidth   = input.int(2, "POC width", minval=1, maxval=6, group=grpVolLines)
+showVA     = input.bool(false, "Show VAH/VAL Lines", group=grpVolLines)
+vaColor    = input.color(#FFA500, "VAH/VAL color", group=grpVolLines)
+vaWidth    = input.int(1, "VAH/VAL width", minval=1, maxval=6, group=grpVolLines)
+showVWAP   = input.bool(false, "Show AVWAP Line", group=grpVolLines)
+vwapColor  = input.color(#0000FF, "AVWAP color", group=grpVolLines)
+vwapWidth  = input.int(1, "AVWAP width", minval=1, maxval=6, group=grpVolLines)
+showVolLineLabels = input.bool(false, "Show Line Labels", group=grpVolLines)
+priceForBin = hlcc4
+
+var boxesArr  = array.new_box()
+var linesArr  = array.new_line()
+var labelsArr = array.new_label()
+
+f_getSize(s) =>
+    switch s
+        "tiny" => size.tiny
+        "small" => size.small
+        "normal" => size.normal
+        "large" => size.large
+        => size.small
+
+abbreviateValue(float value, string precision) =>
+    if value == 0
+        "0"
+    else
+        float digitsAmt = math.log10(math.abs(value))
+        string formatPrecision = "#" + precision
+        string result = switch
+            digitsAmt > 12 => str.tostring(value / 1e12, formatPrecision + "T")
+            digitsAmt > 9 => str.tostring(value / 1e9, formatPrecision + "B")
+            digitsAmt > 6 => str.tostring(value / 1e6, formatPrecision + "M")
+            digitsAmt > 3 => str.tostring(value / 1e3, formatPrecision + "K")
+            => str.tostring(value, "#" + formatPrecision)
+        result
+
+if showVolProfile and barstate.islast
+    // [BUG FIX] this used to also require array.size(boxesArr) == 0, meaning
+    // the whole profile only ever computed ONCE, on the very first bar it
+    // saw as "last" — after that the array was never empty again, so it
+    // stayed frozen forever regardless of new bars, backtesting, or replay.
+    // Fixed by recomputing every time, but first cleaning up the PREVIOUS
+    // profile's boxes/lines/labels so they don't pile up on top of each
+    // other (Pine won't do this automatically).
+    if array.size(boxesArr) > 0
+        for b in boxesArr
+            box.delete(b)
+        for ln in linesArr
+            line.delete(ln)
+        for lb in labelsArr
+            label.delete(lb)
+        array.clear(boxesArr)
+        array.clear(linesArr)
+        array.clear(labelsArr)
+    volEff = math.min(volBarsBack, bar_index + 1)
+    if volEff > 1
+        float volPMin = na
+        float volPMax = na
+        float volPvSum = 0.0
+        float volVSum = 0.0
+        for look = 0 to volEff - 1
+            float lo = low[look]
+            float hi = high[look]
+            volPMin := na(volPMin) ? lo : math.min(volPMin, lo)
+            volPMax := na(volPMax) ? hi : math.max(volPMax, hi)
+            volPvSum += priceForBin[look] * volume[look]
+            volVSum += volume[look]
+        float anchoredVWAP = volVSum > 0 ? volPvSum / volVSum : na
+        if not na(volPMin) and not na(volPMax) and volPMax > volPMin
+            float step = (volPMax - volPMin) / volCols
+            step := step == 0.0 ? syminfo.mintick : step
+            var vols  = array.new_float()
+            var lows  = array.new_float()
+            var highs = array.new_float()
+            array.clear(vols), array.clear(lows), array.clear(highs)
+            for i = 0 to volCols - 1
+                array.push(vols, 0.0)
+                float lo = volPMin + i * step
+                float hi = lo + step
+                array.push(lows, lo)
+                array.push(highs, hi)
+            for look = 0 to volEff - 1
+                float pr = priceForBin[look]
+                float vol = volume[look]
+                int idx = int(math.floor((pr - volPMin) / step))
+                idx := idx < 0 ? 0 : idx > volCols - 1 ? volCols - 1 : idx
+                array.set(vols, idx, array.get(vols, idx) + vol)
+            int pocIdx = 0
+            float pocVol = 0.0
+            float totalVol = 0.0
+            for i = 0 to volCols - 1
+                float v = array.get(vols, i)
+                totalVol += v
+                if v > pocVol
+                    pocVol := v
+                    pocIdx := i
+            float targetVol = totalVol * (volVaPct / 100.0)
+            int left = pocIdx
+            int right = pocIdx
+            float cumVA = array.get(vols, pocIdx)
+            while cumVA < targetVol and (left > 0 or right < volCols - 1)
+                float vLeft = left > 0 ? array.get(vols, left - 1) : -1.0
+                float vRight = right < volCols - 1 ? array.get(vols, right + 1) : -1.0
+                if vRight > vLeft
+                    right += 1
+                    cumVA += array.get(vols, right)
+                else if vLeft >= 0
+                    left -= 1
+                    cumVA += array.get(vols, left)
+                else
+                    break
+            float VAH = array.get(highs, right)
+            float VAL = array.get(lows, left)
+            int volProfileStart = bar_index - (volEff - 1)
+            int volHistStart = bar_index + 1 + volOffset
+            int volHistEnd = volHistStart + volHistWidth
+            bool intoChart = volDirection == "Into chart (left)"
+            for i = 0 to volCols - 1
+                float v = array.get(vols, i)
+                float len = pocVol > 0 ? (v / pocVol) : 0.0
+                int px = int(math.round(len * volHistWidth))
+                int x1 = intoChart ? (volHistEnd - px) : volHistStart
+                int x2 = intoChart ? volHistEnd : (volHistStart + px)
+                float y1 = array.get(lows, i)
+                float y2 = array.get(highs, i)
+                string volText = showVolumeLabels and v > 0 ? abbreviateValue(v, "") : ""
+                b = box.new(x1, y1, x2, y2, xloc=xloc.bar_index,
+                            border_color=color.new(blockBorderColor, blockBorderOpacity),
+                            text=volText,
+                            text_size=f_getSize(volumeLabelSize),
+                            text_color=volLabelColor,
+                            text_halign=intoChart ? text.align_left : text.align_right)
+                box.set_bgcolor(b, color.new(blockFillColor, 100 - blockFillOpacity))
+                array.push(boxesArr, b)
+            if showPOC
+                float pocPrice = (array.get(lows, pocIdx) + array.get(highs, pocIdx)) / 2.0
+                lnPOC = line.new(volProfileStart, pocPrice, volHistEnd, pocPrice, xloc=xloc.bar_index, extend=extend.none, color=pocColor, width=pocWidth)
+                array.push(linesArr, lnPOC)
+                if showVolLineLabels
+                    lbPOC = label.new(volHistEnd, pocPrice, "POC", xloc=xloc.bar_index, style=label.style_label_right, textcolor=color.white, color=pocColor)
+                    array.push(labelsArr, lbPOC)
+            if showVA
+                lnVAL = line.new(volProfileStart, VAL, volHistEnd, VAL, xloc=xloc.bar_index, extend=extend.none, color=vaColor, width=vaWidth)
+                lnVAH = line.new(volProfileStart, VAH, volHistEnd, VAH, xloc=xloc.bar_index, extend=extend.none, color=vaColor, width=vaWidth)
+                array.push(linesArr, lnVAL), array.push(linesArr, lnVAH)
+                if showVolLineLabels
+                    lbVAH = label.new(volHistEnd, VAH, "VAH", xloc=xloc.bar_index, style=label.style_label_right, color=vaColor, textcolor=color.white)
+                    lbVAL = label.new(volHistEnd, VAL, "VAL", xloc=xloc.bar_index, style=label.style_label_right, color=vaColor, textcolor=color.white)
+                    array.push(labelsArr, lbVAH), array.push(labelsArr, lbVAL)
+            if showVWAP and not na(anchoredVWAP)
+                lnVW = line.new(volProfileStart, anchoredVWAP, volHistEnd, anchoredVWAP, xloc=xloc.bar_index, extend=extend.right, color=vwapColor, width=vwapWidth)
+                array.push(linesArr, lnVW)
+                if showVolLineLabels
+                    lbVW = label.new(volHistEnd, anchoredVWAP, "AVWAP", xloc=xloc.bar_index, style=label.style_label_right, color=vwapColor, textcolor=color.white)
+                    array.push(labelsArr, lbVW)
+
+// =============================================================================
+// DASHBOARD  (f_row declared at top level — fixes CE10156 from the standalone file)
+// =============================================================================
+txtSz = dashSize == "Tiny" ? size.tiny : dashSize == "Small" ? size.small : size.normal
+tPos = position.top_right
+if dashPos == "Top left"
+    tPos := position.top_left
+else if dashPos == "Bottom right"
+    tPos := position.bottom_right
+else if dashPos == "Bottom left"
+    tPos := position.bottom_left
+
+var table dash = na
+
+f_row(t, r, k, v, vc) =>
+    table.cell(t, 0, r, k, text_color = color.new(color.gray, 20), text_size = txtSz, text_halign = text.align_left)
+    table.cell(t, 1, r, v, text_color = vc, text_size = txtSz, text_halign = text.align_right)
+
+if showDash and barstate.islast
+    if not na(dash)
+        table.delete(dash)
+    hdrTF = str.upper(tfFVB == "1M" ? "MONTHLY" : tfFVB)
+    winRate = trades > 0 ? 100.0 * wins / trades : na
+    pf      = grossL > 0 ? grossW / grossL : na
+    avgW    = wins > 0 ? 100.0 * grossW / wins : na
+    losses  = trades - wins
+    avgL    = losses > 0 ? -100.0 * grossL / losses : na
+    expct   = trades > 0 ? 100.0 * sumRet / trades : na
+    totRet  = (equity - 1.0) * 100.0
+    avgHold = trades > 0 ? holdSum / trades : na
+    openPL  = inPos ? (close / entryPrice - 1.0) * 100.0 : na
+    if dashCompact
+        // [MOBILE] ~7 rows instead of 17 — combines related stats onto
+        // shared lines rather than shrinking text (shrinking text alone
+        // doesn't help much when the real problem is ROW COUNT eating the
+        // screen on a phone).
+        dash := table.new(tPos, 2, 7, bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 70))
+        table.cell(dash, 0, 0, syminfo.ticker + " " + hdrTF + " " + str.tostring(lenFVB) + "FVB", text_color = color.white, text_size = txtSz)
+        table.merge_cells(dash, 0, 0, 1, 0)
+        f_row(dash, 1, "State / Pos", (isGreen ? "GREEN" : "RED") + " / " + (inPos ? "LONG" : "FLAT"), isGreen ? color.lime : color.red)
+        f_row(dash, 2, "Open P&L", inPos ? str.tostring(openPL, "#.#") + "%" : "-", inPos ? (openPL >= 0 ? color.lime : color.red) : color.gray)
+        f_row(dash, 3, "Trades / Win%", str.tostring(trades) + " / " + (na(winRate) ? "-" : str.tostring(winRate, "#.#") + "%"), color.white)
+        f_row(dash, 4, "PF / Expct", (na(pf) ? "-" : str.tostring(pf, "#.##")) + " / " + (na(expct) ? "-" : str.tostring(expct, "#.#") + "%"), color.white)
+        f_row(dash, 5, "TotalRet / DD", str.tostring(totRet, "#.#") + "% / " + str.tostring(maxDD * 100.0, "#.#") + "%", totRet >= 0 ? color.lime : color.red)
+        f_row(dash, 6, "TP / Stop", str.tostring(tpCnt) + " / " + str.tostring(stopCnt), color.white)
+    else
+        dash := table.new(tPos, 2, 17, bgcolor = color.new(color.black, 15), border_width = 1, border_color = color.new(color.gray, 70))
+        table.cell(dash, 0, 0, hdrTF + " " + str.tostring(lenFVB) + "FVB", text_color = color.white, text_size = txtSz)
+        table.merge_cells(dash, 0, 0, 1, 0)
+        f_row(dash, 1, "Symbol", syminfo.ticker, color.white)
+        f_row(dash, 2, "Entry", bandSel + " band + green", color.white)
+        f_row(dash, 3, "Exit", tpMode == "New N-bar high" ? str.tostring(nBarLen) + "-bar high" : "Equal high (swing)", color.white)
+        f_row(dash, 4, "Stop", stopDef, color.white)
+        f_row(dash, 5, "FVB state", isGreen ? "GREEN" : "RED", isGreen ? color.lime : color.red)
+        f_row(dash, 6, "Position", inPos ? "LONG" : "FLAT", inPos ? color.lime : color.gray)
+        f_row(dash, 7, "Open P&L", inPos ? str.tostring(openPL, "#.#") + "%" : "-", inPos ? (openPL >= 0 ? color.lime : color.red) : color.gray)
+        table.cell(dash, 0, 8, "BACKTEST - this symbol", text_color = color.new(color.gray, 10), text_size = txtSz)
+        table.merge_cells(dash, 0, 8, 1, 8)
+        f_row(dash, 9,  "Trades", str.tostring(trades), color.white)
+        f_row(dash, 10, "Win rate", na(winRate) ? "-" : str.tostring(winRate, "#.#") + "%", color.white)
+        f_row(dash, 11, "Profit factor", na(pf) ? "-" : str.tostring(pf, "#.##"), color.white)
+        f_row(dash, 12, "Avg win", na(avgW) ? "-" : "+" + str.tostring(avgW, "#.#") + "%", color.lime)
+        f_row(dash, 13, "Avg loss", na(avgL) ? "-" : str.tostring(avgL, "#.#") + "%", color.red)
+        f_row(dash, 14, "Expectancy / Total ret", (na(expct) ? "-" : str.tostring(expct, "#.#") + "%") + " / " + str.tostring(totRet, "#.#") + "%", totRet >= 0 ? color.lime : color.red)
+        f_row(dash, 15, "Max DD / Avg hold", str.tostring(maxDD * 100.0, "#.#") + "% / " + (na(avgHold) ? "-" : str.tostring(avgHold, "#.#")), color.white)
+        f_row(dash, 16, "TP / Stop", str.tostring(tpCnt) + " / " + str.tostring(stopCnt), color.white)

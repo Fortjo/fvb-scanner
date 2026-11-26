@@ -1,0 +1,61 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// 
+// This indicator repaints the candles so that every candle's open price is the
+// previous candle's close price. This helps visualize stocks and ETFs that have
+// big gaps, usually between trading days.
+//
+// You should hide visibility of the ticker for this to be displayed properly.
+// 
+// © echepata
+
+//@version=5
+indicator("No gaps candles", overlay=true)
+
+// Input options
+applyToDayOpenOnly = input(false, title="Apply to day open only")
+dayChangeHourThreshold = input(6, title="Hour threshold to detect the day open")
+showPriceLine = input(true, title="Show price line")
+
+// Input options for EMA
+showEMA = input(true, title="Show EMA")
+emaChoice = input.string("50", title="EMA Length", options=["50", "100", "200"])
+emaColor = input.color(color.blue, title="EMA Color")
+
+// Convert the selected EMA length to an integer
+emaLength = switch emaChoice
+    "50" => 50
+    "100" => 100
+    "200" => 200
+    => 50 // Default value if none selected
+
+// Time calculation
+hoursSinceLastCandle = (time[0] - time[1]) / 1000 / 60 / 60
+
+// Initializing variables
+myOpen = open
+myClose = close
+myHigh = high
+myLow = low
+
+if not applyToDayOpenOnly or hoursSinceLastCandle > dayChangeHourThreshold
+    myOpen := close[1]
+    myClose := close
+    myHigh := high
+    myLow := low
+
+// Candle color logic
+candleColor = myOpen <= myClose ? color.teal : color.red
+
+// Plot candles
+plotcandle(myOpen, myHigh, myLow, myClose, color=candleColor, bordercolor=candleColor, wickcolor=candleColor)
+
+// Calculate EMA outside of any conditional scope
+ema = ta.ema(close, emaLength)
+
+// Plot EMA if enabled
+plot(showEMA ? ema : na, color=emaColor, title="EMA")
+
+// Plot price line if enabled
+if barstate.islast
+    if showPriceLine
+        line.new(bar_index - 4999, close, bar_index + 500, close, color=candleColor, style=line.style_dotted, width=1)

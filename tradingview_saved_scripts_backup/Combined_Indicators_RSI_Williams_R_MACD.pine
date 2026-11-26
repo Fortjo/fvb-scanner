@@ -1,0 +1,37 @@
+//@version=4
+study("Combined Indicators: RSI, Williams %R, MACD", shorttitle="Combined Indicators", overlay=false)
+
+// RSI
+rsiLength = input(14, title="RSI Length")
+rsiSource = input(close, title="RSI Source")
+rsi = rsi(rsiSource, rsiLength)
+hline(70, "RSI Overbought", color=color.red)
+hline(30, "RSI Oversold", color=color.green)
+hline(50, "RSI Midline", color=color.gray, linewidth=1, linestyle=hline.style_dotted) // Adding a faint gray line at the 50 level
+plot(rsi, title="RSI", color=color.purple, linewidth=2)
+
+// Create a visual separation for RSI panel
+plot(na)
+
+// Williams %R
+williamsLength = input(14, title="Williams %R Length")
+williamsR = -100 * ((highest(high, williamsLength) - close) / (highest(high, williamsLength) - lowest(low, williamsLength)))
+hline(-20, "Williams %R Overbought", color=color.red)
+hline(-80, "Williams %R Oversold", color=color.green)
+plot(williamsR, title="Williams %R", color=color.orange, linewidth=2)
+
+// Create a visual separation for Williams %R panel
+plot(na)
+
+// MACD
+macdShortLength = input(12, title="MACD Short Length")
+macdLongLength = input(26, title="MACD Long Length")
+macdSignalSmoothing = input(9, title="MACD Signal Smoothing")
+[macdLine, signalLine, _] = macd(close, macdShortLength, macdLongLength, macdSignalSmoothing)
+hline(0, "MACD Zero Line", color=color.gray)
+plot(macdLine, title="MACD Line", color=color.blue, linewidth=2)
+
+// Create a visual separation for MACD panel
+plot(na)
+plot(signalLine, title="Signal Line", color=color.red, linewidth=2)
+plot(macdLine - signalLine, title="MACD Histogram", style=plot.style_histogram, color=color.green, linewidth=2)
