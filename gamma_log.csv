@@ -1,3 +1,5 @@
 date,ticker,spot,vix,net_gex_bn,regime,call_wall,put_wall,call_oi_wall,put_oi_wall,gamma_flip,n_contracts
 2026-11-26,SPY,716.7,28.29,-6.598,negative,730.0,700.0,775.0,700.0,,3588
 2026-11-26,QQQ,633.93,28.29,-2.523,negative,680.0,640.0,700.0,550.0,,3593
+2026-11-27,SPY,716.7,26.8,-6.628,negative,730.0,700.0,775.0,700.0,,3588
+2026-11-27,QQQ,633.93,26.8,-2.55,negative,680.0,640.0,700.0,550.0,,3593
