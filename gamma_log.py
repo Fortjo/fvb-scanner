@@ -49,7 +49,15 @@ def bs_gamma(S, K, T, iv):
 def compute(ticker: str, now: datetime) -> dict | None:
     tk = yf.Ticker(ticker)
     hist = tk.history(period="5d")
-    spot = float(hist["Close"].dropna().iloc[-1]) if not hist["Close"].dropna().empty else float("nan")
+    closes = hist["Close"].dropna()
+    spot = float(closes.iloc[-1]) if not closes.empty else float("nan")
+    # The calendar date this script happens to run on is NOT reliable: GitHub Actions
+    # schedules fire late (sometimes hours late), and on US market holidays or before
+    # the open there's no new session at all, so Yahoo just hands back the last real
+    # trading day's close. Date every row by that REAL session, not by `now`, so a
+    # late/holiday run naturally collapses into the session it actually reflects
+    # instead of relabeling stale data as a brand-new day.
+    trade_date = closes.index[-1].strftime("%Y-%m-%d") if not closes.empty else None
     if not (spot > 0):
         # fast_info is a different Yahoo endpoint -- try it before giving up
         try:
@@ -59,6 +67,9 @@ def compute(ticker: str, now: datetime) -> dict | None:
     if not (spot > 0):
         print(f"{ticker}: no valid spot price (history tail: "
               f"{hist['Close'].tail(3).to_dict() if not hist.empty else 'EMPTY'}) -- skipped")
+        return None
+    if trade_date is None:
+        print(f"{ticker}: no price history at all -- skipped")
         return None
     rows = []
     for exp in tk.options:
@@ -95,6 +106,7 @@ def compute(ticker: str, now: datetime) -> dict | None:
     flip = min(flips, key=lambda s: abs(s - spot)) if flips else None
     return {
         "ticker": ticker,
+        "trade_date": trade_date,
         "spot": round(spot, 2),
         "net_gex_bn": round(net / 1e9, 3),
         "regime": "positive" if net > 0 else "negative",
@@ -121,10 +133,11 @@ def main():
             print(f"{t}: error {e!r} -- skipped")
             r = None
         if r:
-            r = {"date": now.strftime("%Y-%m-%d"), "vix": vix, **r}
+            r = {"date": r.pop("trade_date"), "vix": vix, **r}
             out.append(r)
-            print(f"{t}: spot {r['spot']}  call wall {r['call_wall']:g}  put wall {r['put_wall']:g}  "
-                  f"flip {r['gamma_flip']}  net {r['net_gex_bn']:+.2f}B ({r['regime']})  VIX {vix}")
+            print(f"{t}: session {r['date']}  spot {r['spot']}  call wall {r['call_wall']:g}  "
+                  f"put wall {r['put_wall']:g}  flip {r['gamma_flip']}  "
+                  f"net {r['net_gex_bn']:+.2f}B ({r['regime']})  VIX {vix}")
     if not out:
         print("Nothing logged today.")
         return
@@ -134,10 +147,18 @@ def main():
     new = new[cols]
     if os.path.exists(LOG):
         old = pd.read_csv(LOG)
-        old = old[~((old.date == new.date.iloc[0]) & (old.ticker.isin(new.ticker)))]  # rerun-safe
+        # dedupe by the REAL session date (not run time): if we already have this
+        # ticker's reading for that trading day, this run is a re-fetch of stale
+        # data (holiday, delayed scheduler, pre-open run) and adds nothing new
+        key = set(zip(new.date, new.ticker))
+        skipped = old[old.apply(lambda row: (row.date, row.ticker) in key, axis=1)]
+        for _, row in skipped.iterrows():
+            print(f"{row.ticker}: already have session {row.date} -- not re-logging as a new day")
+        old = old[~old.apply(lambda row: (row.date, row.ticker) in key, axis=1)]
         new = pd.concat([old, new], ignore_index=True)
+    new = new.sort_values(["date", "ticker"]).reset_index(drop=True)
     new.to_csv(LOG, index=False)
-    print(f"Appended to {LOG} ({len(new)} rows total)")
+    print(f"Logged. {LOG} now has {len(new)} rows total.")
 
 
 if __name__ == "__main__":
