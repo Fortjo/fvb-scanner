@@ -531,7 +531,13 @@ def run(df: pd.DataFrame, band: str, exit_mode: str,
             if exit_px is not None:
                 ret = exit_px / entry_px - 1 - RT_COST
                 trades.append({"entry_date": idx[entry_i], "exit_date": idx[i],
-                               "ret": ret, "hold": i - entry_i, "reason": reason})
+                               "ret": ret, "hold": i - entry_i, "reason": reason,
+                               # [ADDITIVE] raw fill prices -- purely informational,
+                               # no existing consumer reads these, nothing above
+                               # changes. Needed by exit-timing research (does a
+                               # structure flip mid-trade warn earlier than the
+                               # band itself) without reimplementing this loop.
+                               "entry_px": entry_px, "exit_px": exit_px})
                 in_pos = False
                 continue
         # [BUG FIX] require prior close was already above the prior band —
