@@ -78,6 +78,10 @@ def build_email_body(fresh_weeks: int = 12, regime_info: dict = None) -> str:
             thin_warn = " ** THIN BAND SAMPLE — verify on TradingView Monthly chart before acting **" if row.get("thin_sample") else ""
             struct_tag = row.get("daily_structure", "INSUFFICIENT")
             struct_line = f"  Daily structure: {struct_tag}" if struct_tag != "INSUFFICIENT" else ""
+            week_struct_tag = row.get("weekly_structure", "INSUFFICIENT")
+            week_struct_line = f"  Weekly structure: {week_struct_tag}" if week_struct_tag != "INSUFFICIENT" else ""
+            confirmed_line = ("  ✓ Daily+Weekly structure agree BULLISH (validated: 76.4% win vs "
+                               "69.8% when they disagree)") if row.get("structure_confirmed") else ""
             rr = row["risk_reward"]
             rr_str = f"{rr:.1f}" if pd.notna(rr) else "n/a"
             lines.append(f"\n{row['ticker']}  —  {row['rating']}")
@@ -101,6 +105,10 @@ def build_email_body(fresh_weeks: int = 12, regime_info: dict = None) -> str:
                               f"{bt.CLOSE_POSITION_MIN_THRESHOLD} cutoff, historically the weaker half")
             if struct_line:
                 lines.append(struct_line)
+            if week_struct_line:
+                lines.append(week_struct_line)
+            if confirmed_line:
+                lines.append(confirmed_line)
             # [FUNDAMENTALS] Peter's checklist 2-4 -- moat (5) is never
             # checked here, that stays your own call.
             fund_rating, fund_reason = row.get("fund_rating"), row.get("fund_reason")
@@ -143,6 +151,12 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int, acct: dict = 
         struct_colors = {"BULLISH": "#1e8449", "MIXED": "#7d7d00", "BEARISH": "#c0392b"}
         struct_html = (f'<br><span style="color:{struct_colors.get(struct_tag,"#555")};">'
                        f'Daily structure: {struct_tag}</span>') if struct_tag != "INSUFFICIENT" else ""
+        week_struct_tag = row.get("weekly_structure", "INSUFFICIENT")
+        week_struct_html = (f'<br><span style="color:{struct_colors.get(week_struct_tag,"#555")};">'
+                            f'Weekly structure: {week_struct_tag}</span>') if week_struct_tag != "INSUFFICIENT" else ""
+        confirmed_html = ('<br><span style="color:#1e8449;font-weight:bold;">'
+                           '&#10003; Daily+Weekly agree BULLISH (76.4% win vs 69.8% when they disagree)</span>'
+                           ) if row.get("structure_confirmed") else ""
         cp, strength = row.get("close_position"), row.get("entry_strength")
         if strength == "STRONG":
             strength_html = (f'<br><span style="color:#1e8449;font-weight:bold;">'
@@ -181,7 +195,7 @@ def build_email_body_html(fresh: pd.DataFrame, total_checked: int, acct: dict = 
           <td style="padding:8px;border-bottom:1px solid #ddd;">{row['hist_trades']:.0f} trades<br>
               <span style="color:#666;font-size:12px;">{row['hist_win_rate']:.1f}% win, {row['hist_expectancy']:+.1f}% exp.<br>
               {('Typical DD ' + format(row['hist_median_dd'], '.1f') + '% (worst ' + format(row['hist_worst_dd'], '.1f') + '%)') if pd.notna(row.get('hist_median_dd')) else ''}</span></td>
-          <td style="padding:8px;border-bottom:1px solid #ddd;">{rr_str}{below_warn}{thin_warn}{struct_html}{strength_html}{fund_html}</td>
+          <td style="padding:8px;border-bottom:1px solid #ddd;">{rr_str}{below_warn}{thin_warn}{struct_html}{week_struct_html}{confirmed_html}{strength_html}{fund_html}</td>
           {size_cell}
         </tr>""")
 

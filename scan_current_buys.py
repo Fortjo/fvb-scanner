@@ -55,6 +55,12 @@ def scan_ticker(tk: str, fresh_weeks: int):
     # confidence tag — does not affect entry/exit/trade logic above.
     daily = bt.fetch_daily(tk)
     daily_structure = bt.daily_structure_tag(daily)
+    # [WEEKLY STRUCTURE TAG] same pivot logic on the weekly bars we already
+    # have in hand (`df`, just above) — no extra fetch. See
+    # bt.weekly_structure_tag's docstring for the validation (daily+weekly
+    # BOTH bullish: 76.4% win vs 69.8% when they disagree, 1,851 real trades).
+    weekly_structure = bt.weekly_structure_tag(df)
+    structure_confirmed = daily_structure == "BULLISH" and weekly_structure == "BULLISH"
 
     # [PERFORMANCE FIX] this used to call bt.run() for historical stats AND
     # ALSO run a separate, near-identical loop below to track the live
@@ -126,6 +132,8 @@ def scan_ticker(tk: str, fresh_weeks: int):
         "straddle_sample": straddle_n,
         "thin_sample": straddle_n < 75,
         "daily_structure": daily_structure,
+        "weekly_structure": weekly_structure,
+        "structure_confirmed": structure_confirmed,
         "hist_median_dd": hist_median_dd,
         "hist_worst_dd": hist_worst_dd,
     }

@@ -422,6 +422,40 @@ def daily_structure_tag(daily, piv_l: int = 10, piv_r: int = 10) -> str:
         return "BEARISH"
     return "MIXED"
 
+
+def weekly_structure_tag(weekly_df, asof_i: int | None = None, piv_l: int = 5, piv_r: int = 5) -> str:
+    """Same BULLISH/MIXED/BEARISH/INSUFFICIENT read as daily_structure_tag, but on
+    the WEEKLY bars already fetched for every trade (no extra data needed — this
+    is the same `df` passed to run()). Reads only pivots confirmed at or before
+    `asof_i` (defaults to the latest bar) — no lookahead.
+    Validated (mtf_structure_alignment_test_2026-11-28.md, fvb-scanner repo):
+    across 1,851 real historical trades, requiring DAILY and WEEKLY structure to
+    BOTH read BULLISH at entry raised win rate from 69.8% / +14.2% expectancy
+    (when they disagree) to 76.4% / +17.7% expectancy (n=297 both-bullish vs
+    n=1,459 disagreeing). Weekly alone is a weaker signal than daily alone; the
+    value here is specifically in requiring AGREEMENT between the two.
+    Diagnostic/confidence tag only — does not affect entry/exit/trade logic.
+    """
+    if asof_i is None:
+        asof_i = len(weekly_df) - 1
+    h = weekly_df["High"].values[:asof_i + 1]
+    l = weekly_df["Low"].values[:asof_i + 1]
+    if len(h) < piv_l + piv_r + 2:
+        return "INSUFFICIENT"
+    conf_h = _confirmed_pivots(h, piv_l, piv_r, "high")
+    conf_l = _confirmed_pivots(l, piv_l, piv_r, "low")
+    hi = np.where(~np.isnan(conf_h))[0]
+    lo = np.where(~np.isnan(conf_l))[0]
+    if len(hi) < 2 or len(lo) < 2:
+        return "INSUFFICIENT"
+    last_h, prev_h = conf_h[hi[-1]], conf_h[hi[-2]]
+    last_l, prev_l = conf_l[lo[-1]], conf_l[lo[-2]]
+    if last_h > prev_h and last_l > prev_l:
+        return "BULLISH"
+    if last_h < prev_h and last_l < prev_l:
+        return "BEARISH"
+    return "MIXED"
+
 # --------------------------------------------------------------------------
 # INDICATOR PREP  (monthly FVB -> weekly bars, shifted 1 month, no lookahead)
 # --------------------------------------------------------------------------
