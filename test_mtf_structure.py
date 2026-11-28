@@ -79,7 +79,12 @@ def fetch_hourly(ticker: str):
 def hourly_structure_tag(hourly: pd.DataFrame, asof_ts, piv_l=HOURLY_PIV_L, piv_r=HOURLY_PIV_R) -> str:
     if hourly is None:
         return "NO_DATA"
-    h = hourly.loc[hourly.index <= asof_ts]
+    # yfinance's 60m index is tz-aware (America/New_York); entry dates from the
+    # weekly fetch are tz-naive. Normalize both to naive before comparing.
+    idx = hourly.index.tz_localize(None) if hourly.index.tz is not None else hourly.index
+    asof = pd.Timestamp(asof_ts)
+    asof = asof.tz_localize(None) if asof.tzinfo is not None else asof
+    h = hourly.loc[idx <= asof]
     if len(h) < piv_l + piv_r + 2:
         return "INSUFFICIENT"
     conf_h = bt._confirmed_pivots(h["High"].values, piv_l, piv_r, "high")
