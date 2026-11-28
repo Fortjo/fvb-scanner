@@ -114,11 +114,38 @@ def part1_4h(all_trades):
         print("No recent trades available.")
 
 
+def _pivot_lookup_table(values_high, values_low, piv_l, piv_r):
+    """Precompute confirmed pivots ONCE for a full series, then return a fast
+    as-of lookup: given a bar position i, which two pivot highs/lows were
+    confirmed at or before i. O(n) once per ticker instead of O(n) per day
+    (the naive re-scan-from-scratch approach does not scale to walking every
+    day of every trade across the whole universe)."""
+    ch = bt._confirmed_pivots(values_high, piv_l, piv_r, "high")
+    cl = bt._confirmed_pivots(values_low, piv_l, piv_r, "low")
+    hi_idx = np.where(~np.isnan(ch))[0]
+    lo_idx = np.where(~np.isnan(cl))[0]
+
+    def tag_asof(i):
+        hpos = np.searchsorted(hi_idx, i, side="right") - 1
+        lpos = np.searchsorted(lo_idx, i, side="right") - 1
+        if hpos < 1 or lpos < 1:
+            return "INSUFFICIENT"
+        lh, ph = ch[hi_idx[hpos]], ch[hi_idx[hpos - 1]]
+        ll, pl = cl[lo_idx[lpos]], cl[lo_idx[lpos - 1]]
+        if lh > ph and ll > pl:
+            return "BULLISH"
+        if lh < ph and ll < pl:
+            return "BEARISH"
+        return "MIXED"
+    return tag_asof
+
+
 def part2_exit_timing(all_trades):
     print("\n" + "=" * 70)
     print("PART 2: exit timing -- structure flip to BEARISH mid-trade vs real FVB exit")
     print("=" * 70)
     daily_cache = {}
+    weekly_lookup_cache = {}
     n_daily_early, n_weekly_early = 0, 0
     daily_lead, weekly_lead = [], []
     daily_alt_ret, daily_real_ret = [], []
@@ -127,19 +154,23 @@ def part2_exit_timing(all_trades):
         tk = r["tk"]
         ed, xd = pd.Timestamp(r["entry_date"]), pd.Timestamp(r["exit_date"])
         entry_px = r["entry_px"]
-        # ---- daily structure flip ----
+        # ---- daily structure flip (lookup table built once per ticker) ----
         if tk not in daily_cache:
             try:
-                daily_cache[tk] = bt.fetch_daily(tk)
+                d = bt.fetch_daily(tk)
             except Exception:
-                daily_cache[tk] = None
-        daily = daily_cache[tk]
+                d = None
+            if d is not None:
+                daily_cache[tk] = (d, _pivot_lookup_table(d["High"].values, d["Low"].values, 10, 10))
+            else:
+                daily_cache[tk] = (None, None)
+        daily, daily_tag_asof = daily_cache[tk]
         if daily is not None:
-            window = daily[(daily.index > ed) & (daily.index <= xd)]
+            window_idx = daily.index[(daily.index > ed) & (daily.index <= xd)]
             flip_date = None
-            for day in window.index:
-                tag = bt.daily_structure_tag(daily[daily.index <= day])
-                if tag == "BEARISH":
+            for day in window_idx:
+                pos = daily.index.get_loc(day)
+                if daily_tag_asof(pos) == "BEARISH":
                     flip_date = day
                     break
             if flip_date is not None and flip_date < xd:
@@ -148,13 +179,15 @@ def part2_exit_timing(all_trades):
                 alt_px = daily.loc[flip_date, "Close"]
                 daily_alt_ret.append(alt_px / entry_px - 1 - bt.RT_COST)
                 daily_real_ret.append(r["ret"])
-        # ---- weekly structure flip (using the weekly df, same pivots as the FVB system) ----
+        # ---- weekly structure flip (same pivots as the FVB system, lookup table) ----
         wdf = r["_wdf"]
+        if tk not in weekly_lookup_cache:
+            weekly_lookup_cache[tk] = _pivot_lookup_table(wdf["High"].values, wdf["Low"].values, 5, 5)
+        weekly_tag_asof = weekly_lookup_cache[tk]
         wi_entry, wi_exit = r["_i_entry"], r["_i_exit"]
         flip_i = None
         for wi in range(wi_entry + 1, wi_exit + 1):
-            tag = weekly_tag_cached(wdf, wi)
-            if tag == "BEARISH":
+            if weekly_tag_asof(wi) == "BEARISH":
                 flip_i = wi
                 break
         if flip_i is not None and flip_i < wi_exit:
@@ -183,31 +216,6 @@ def part2_exit_timing(all_trades):
               f"vs real exit mean {100*np.mean(weekly_real_ret):+.2f}% (same {len(weekly_alt_ret)} trades)")
         better = sum(1 for a, b in zip(weekly_alt_ret, weekly_real_ret) if a > b)
         print(f"  early exit would have been BETTER on {better}/{len(weekly_alt_ret)} of those trades")
-
-
-_weekly_tag_cache = {}
-
-
-def weekly_tag_cached(wdf_id_and_df, wi):
-    wdf = wdf_id_and_df
-    key = (id(wdf), wi)
-    if key not in _weekly_tag_cache:
-        h, l = wdf["High"].values[:wi + 1], wdf["Low"].values[:wi + 1]
-        if len(h) < 12:
-            _weekly_tag_cache[key] = "INSUFFICIENT"
-        else:
-            ch = bt._confirmed_pivots(h, 5, 5, "high")
-            cl = bt._confirmed_pivots(l, 5, 5, "low")
-            hi, lo = np.where(~np.isnan(ch))[0], np.where(~np.isnan(cl))[0]
-            if len(hi) < 2 or len(lo) < 2:
-                _weekly_tag_cache[key] = "INSUFFICIENT"
-            elif ch[hi[-1]] > ch[hi[-2]] and cl[lo[-1]] > cl[lo[-2]]:
-                _weekly_tag_cache[key] = "BULLISH"
-            elif ch[hi[-1]] < ch[hi[-2]] and cl[lo[-1]] < cl[lo[-2]]:
-                _weekly_tag_cache[key] = "BEARISH"
-            else:
-                _weekly_tag_cache[key] = "MIXED"
-    return _weekly_tag_cache[key]
 
 
 def main():
